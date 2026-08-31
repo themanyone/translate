@@ -110,6 +110,25 @@ class TranslateError(RuntimeError):
     """Translation failed; str(exc) is safe to show the user."""
 
 
+def _debug_command(
+    cmd: list[str] | str,
+    debug: bool,
+    stderr=None,
+    input_text: str | None = None,
+) -> None:
+    """Echo the exact shell command being executed when --debug is on."""
+    if not debug:
+        return
+    out = stderr if stderr is not None else sys.stderr
+    if isinstance(cmd, str):
+        rendered = cmd
+    else:
+        rendered = " ".join(shlex.quote(part) for part in cmd)
+    if input_text is not None:
+        rendered += f" <<< {shlex.quote(input_text)}"
+    print(f"debug: {rendered}", file=out)
+
+
 def resolve_language(spec: str) -> str:
     """Map a language name, 639-1 code, or 639-2 alias to a 639-1 code."""
     key = spec.strip().lower()
@@ -157,13 +176,23 @@ def build_prompt(text: str, source: str, target: str) -> str:
     )
 
 
-def _chat(server_url: str, prompt: str, timeout: float = 180.0) -> str:
+def _chat(
+    server_url: str,
+    prompt: str,
+    timeout: float = 180.0,
+    debug: bool = False,
+    stderr=None,
+) -> str:
     """One chat completion; returns the stripped assistant content."""
     payload = json.dumps(
         {"messages": [{"role": "user", "content": prompt}]}
     ).encode()
+    endpoint = f"{server_url.rstrip('/')}/v1/chat/completions"
+    _debug_command(
+        f"POST {endpoint}", debug, stderr, input_text=prompt
+    )
     request = urllib.request.Request(
-        f"{server_url.rstrip('/')}/v1/chat/completions",
+        endpoint,
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -178,11 +207,13 @@ def _chat_with_retry(
     prompt: str,
     timeout: float = 180.0,
     max_attempts: int = 2,
+    debug: bool = False,
+    stderr=None,
 ) -> str:
     last_error: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            return _chat(server_url, prompt, timeout)
+            return _chat(server_url, prompt, timeout, debug, stderr)
         except urllib.error.HTTPError as err:
             detail = ""
             try:
@@ -207,11 +238,18 @@ def _chat_with_retry(
     raise TranslateError(f"cannot reach translation server: {last_error}")
 
 
-def detect_language(server_url: str, text: str) -> str:
+def detect_language(
+    server_url: str,
+    text: str,
+    debug: bool = False,
+    stderr=None,
+) -> str:
     """Ask the running model for the input text's ISO 639-1 code."""
     if not text.strip():
         raise TranslateError("nothing to detect in empty input")
-    answer = _chat_with_retry(server_url, DETECT_PROMPT + text.strip())
+    answer = _chat_with_retry(
+        server_url, DETECT_PROMPT + text.strip(), debug=debug, stderr=stderr
+    )
     match = _ANSWER_RE.match(answer)
     if not match:
         raise TranslateError(f"could not detect language: {answer!r}")
@@ -228,10 +266,17 @@ def translate(
     target: str,
     timeout: float = 180.0,
     max_attempts: int = 2,
+    debug: bool = False,
+    stderr=None,
 ) -> str:
     """Send the translation prompt to llama-server, return bare translation."""
     content = _chat_with_retry(
-        server_url, build_prompt(text, source, target), timeout, max_attempts
+        server_url,
+        build_prompt(text, source, target),
+        timeout,
+        max_attempts,
+        debug,
+        stderr,
     )
     if not content:
         raise TranslateError("the model returned an empty translation")
@@ -279,10 +324,17 @@ def wait_for_server(url: str, timeout: float = 120.0) -> bool:
     return False
 
 
-def _start_server_detached(host: str, port: int, state_dir: Path) -> int:
+def _start_server_detached(
+    host: str,
+    port: int,
+    state_dir: Path,
+    debug: bool = False,
+    stderr=None,
+) -> int:
     state_dir.mkdir(parents=True, exist_ok=True)
     log_path = state_dir / "server.log"
     cmd = server_command(host, port)
+    _debug_command(cmd, debug, stderr)
     with open(log_path, "ab") as log_file:
         process = subprocess.Popen(
             cmd,
@@ -319,6 +371,7 @@ def ensure_server(
     port: int,
     auto_start: bool,
     stderr=None,
+    debug: bool = False,
 ) -> str:
     """Return a healthy server base URL, starting the server if allowed."""
     out = stderr if stderr is not None else sys.stderr
@@ -344,7 +397,9 @@ def ensure_server(
             return url
         if lock_fd is not None:
             # We hold the lock: we are the instance that spawns the server.
-            _start_server_detached(host, port, STATE_DIR)
+            _start_server_detached(
+                host, port, STATE_DIR, debug=debug, stderr=out
+            )
         # Either we spawned it or another instance is starting it now;
         # in both cases, wait for the health endpoint.
         if not wait_for_server(health_url(host, port)):
@@ -404,7 +459,9 @@ def stop_server(state_dir: Path | None = None) -> bool:
 
 # --- speech ----------------------------------------------------------------
 
-def voice_for_language(lang: str) -> str | None:
+def voice_for_language(
+    lang: str, debug: bool = False, stderr=None
+) -> str | None:
     """Find a piper voice file for an output language.
 
     Preferred voices first, then any {lang}_* file already downloaded,
@@ -419,6 +476,7 @@ def voice_for_language(lang: str) -> str | None:
     if existing:
         return str(existing[0])
     # Not on disk: consult download_voices for the first matching voice.
+    _debug_command([DOWNLOAD_VOICES], debug, stderr)
     try:
         listing = subprocess.run(
             [DOWNLOAD_VOICES], capture_output=True, text=True, timeout=60
@@ -432,10 +490,13 @@ def voice_for_language(lang: str) -> str | None:
         name = line.strip()
         if name.startswith(f"{lang}_"):
             print(f"downloading voice {name}...", file=sys.stderr)
+            download_cmd = [
+                DOWNLOAD_VOICES, "--download-dir", str(PIPER_DIR), name
+            ]
+            _debug_command(download_cmd, debug, stderr)
             try:
                 result = subprocess.run(
-                    [DOWNLOAD_VOICES, "--download-dir", str(PIPER_DIR),
-                     name],
+                    download_cmd,
                     capture_output=True, text=True, timeout=600,
                 )
             except (OSError, subprocess.TimeoutExpired) as err:
@@ -450,21 +511,26 @@ def voice_for_language(lang: str) -> str | None:
     return None
 
 
-def speak(text: str, lang: str) -> bool:
+def speak(
+    text: str, lang: str, debug: bool = False, stderr=None
+) -> bool:
     """Say the translation aloud; False on any failure (never raises).
 
     piper plays the audio itself: text goes to its stdin, no output file.
     """
-    voice = voice_for_language(lang)
+    voice = voice_for_language(lang, debug=debug, stderr=stderr)
     if voice is None:
+        out = stderr if stderr is not None else sys.stderr
         print(
             f"warning: no piper voice found for language {lang!r}",
-            file=sys.stderr,
+            file=out,
         )
         return False
+    piper_cmd = [PIPER, "--cuda", "--model", voice]
+    _debug_command(piper_cmd, debug, stderr, input_text=text)
     try:
         piper_proc = subprocess.Popen(
-            [PIPER, "--cuda", "--model", voice],
+            piper_cmd,
             stdin=subprocess.PIPE,
         )
         piper_proc.stdin.write(text.encode())
@@ -515,6 +581,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help=f"server port (default {DEFAULT_PORT})",
     )
     parser.add_argument(
+        "--debug", action="store_true",
+        help="print the exact shell commands and requests being executed",
+    )
+    parser.add_argument(
         "--stop-server", dest="stop", action="store_true",
         help="stop the auto-started llama-server and exit",
     )
@@ -554,6 +624,8 @@ def translate_once(
     to_lang: str | None,
     speak_flag: bool,
     stdout=None,
+    debug: bool = False,
+    stderr=None,
 ) -> None:
     """Detect (unless told), translate, print, and speak one phrase."""
     if not text.strip():
@@ -561,7 +633,9 @@ def translate_once(
     direction_source = from_lang
     if direction_source is None:
         try:
-            direction_source = detect_language(server_url, text)
+            direction_source = detect_language(
+                server_url, text, debug=debug, stderr=stderr
+            )
         except TranslateError as err:
             if to_lang is not None:
                 direction_source = None  # cannot detect; --to still known
@@ -573,11 +647,13 @@ def translate_once(
         # unless the target is English, in which case assume Russian.
         direction_source = "ru" if to_lang == "en" else "en"
     target = pick_target(direction_source, to_lang)
-    translation = translate(server_url, text, direction_source, target)
+    translation = translate(
+        server_url, text, direction_source, target, debug=debug, stderr=stderr
+    )
     out = stdout if stdout is not None else sys.stdout
     print(f"{target}: {translation}", file=out)
     if speak_flag:
-        speak(translation, target)
+        speak(translation, target, debug=debug, stderr=stderr)
 
 
 def run_repl(
@@ -586,6 +662,7 @@ def run_repl(
     to_lang: str | None,
     speak_flag: bool,
     stdout=None,
+    debug: bool = False,
 ) -> None:
     out = stdout if stdout is not None else sys.stdout
     print("type a phrase in any language; q to quit", file=out)
@@ -601,7 +678,8 @@ def run_repl(
             return
         try:
             translate_once(
-                line, server_url, from_lang, to_lang, speak_flag, stdout=out
+                line, server_url, from_lang, to_lang, speak_flag,
+                stdout=out, debug=debug,
             )
         except TranslateError as err:
             print(f"error: {err}", file=sys.stderr)
@@ -631,7 +709,9 @@ def main(argv: list[str] | None = None) -> int:
             server_url = external_url
         elif host_port is not None:
             host, port = host_port
-            server_url = ensure_server(host, port, auto_start)
+            server_url = ensure_server(
+                host, port, auto_start, debug=args.debug
+            )
         else:  # pragma: no cover - resolve_server_url always fills one
             raise TranslateError("no server configured")
     except TranslateError:
@@ -644,10 +724,11 @@ def main(argv: list[str] | None = None) -> int:
                 args.from_lang,
                 args.to_lang,
                 args.speak_flag,
+                debug=args.debug,
             )
         else:
             run_repl(server_url, args.from_lang, args.to_lang,
-                     args.speak_flag)
+                     args.speak_flag, debug=args.debug)
     except TranslateError as err:
         print(f"error: {err}", file=sys.stderr)
         return 1

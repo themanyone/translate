@@ -296,7 +296,7 @@ class TestSpeak(unittest.TestCase):
         ) as vf, mock.patch("trans.subprocess.Popen") as popen:
             popen.return_value.wait.return_value = 0
             self.assertTrue(speak("Привет!", "ru"))
-        vf.assert_called_once_with("ru")
+        vf.assert_called_once_with("ru", debug=False, stderr=None)
         argv = popen.call_args[0][0]
         self.assertEqual(argv[0], "/home/k/.local/sbin/piper")
         self.assertIn("--cuda", argv)
@@ -530,6 +530,10 @@ class TestCLI(unittest.TestCase):
     def test_parse_args_empty_phrase_is_repl(self):
         self.assertEqual(parse_args([]).phrase, [])
 
+    def test_parse_args_debug_flag(self):
+        self.assertTrue(parse_args(["--debug", "hi"]).debug)
+        self.assertFalse(parse_args(["hi"]).debug)
+
     def test_parse_args_rejects_unknown_flag(self):
         with self.assertRaises(SystemExit), \
                 mock.patch("sys.stderr"):
@@ -561,7 +565,7 @@ class TestCLI(unittest.TestCase):
                 "Hello!", "http://x", None, None, True, stdout=out
             )
         self.assertEqual(out.getvalue(), "es: ¡Hola!\n")
-        sp.assert_called_once_with("¡Hola!", "es")
+        sp.assert_called_once_with("¡Hola!", "es", debug=False, stderr=None)
 
     def test_translate_once_english_defaults_to_spanish(self):
         out = io.StringIO()
@@ -571,7 +575,10 @@ class TestCLI(unittest.TestCase):
             translate_once(
                 "Hello!", "http://x", None, None, True, stdout=out
             )
-        tr.assert_called_once_with("http://x", "Hello!", "en", "es")
+        tr.assert_called_once_with(
+            "http://x", "Hello!", "en", "es",
+            debug=False, stderr=None,
+        )
 
     def test_translate_once_foreign_defaults_to_english(self):
         out = io.StringIO()
@@ -581,7 +588,10 @@ class TestCLI(unittest.TestCase):
             translate_once(
                 "Bonjour", "http://x", None, None, True, stdout=out
             )
-        tr.assert_called_once_with("http://x", "Bonjour", "fr", "en")
+        tr.assert_called_once_with(
+            "http://x", "Bonjour", "fr", "en",
+            debug=False, stderr=None,
+        )
 
     def test_translate_once_explicit_from_skips_detection(self):
         out = io.StringIO()
@@ -592,7 +602,10 @@ class TestCLI(unittest.TestCase):
                 "Bonjour", "http://x", "fr", "de", True, stdout=out
             )
         det.assert_not_called()
-        tr.assert_called_once_with("http://x", "Bonjour", "fr", "de")
+        tr.assert_called_once_with(
+            "http://x", "Bonjour", "fr", "de",
+            debug=False, stderr=None,
+        )
 
     def test_translate_once_blank_input_noop(self):
         out = io.StringIO()
@@ -696,6 +709,116 @@ class TestCLI(unittest.TestCase):
             up.call_args[0][0].full_url,
             "http://elsewhere:9999/v1/chat/completions",
         )
+
+
+class TestDebug(unittest.TestCase):
+    """--debug echoes every external command and HTTP request."""
+
+    def test_start_server_detached_prints_shell_command(self):
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as state, \
+                mock.patch("trans.STATE_DIR", Path(state)), \
+                mock.patch("trans.subprocess.Popen") as popen:
+            popen.return_value.pid = 4242
+            trans._start_server_detached(
+                "127.0.0.1", 8144, Path(state), debug=True, stderr=err
+            )
+        self.assertIn("llama-server", err.getvalue())
+        self.assertIn("--chat-template-file", err.getvalue())
+        self.assertIn("--temp 0", err.getvalue())
+
+    def test_start_server_detached_quiet_by_default(self):
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as state, \
+                mock.patch("trans.STATE_DIR", Path(state)), \
+                mock.patch("trans.subprocess.Popen") as popen:
+            popen.return_value.pid = 4242
+            trans._start_server_detached(
+                "127.0.0.1", 8144, Path(state), debug=False, stderr=err
+            )
+        self.assertEqual(err.getvalue(), "")
+
+    def test_speak_prints_piper_command(self):
+        err = io.StringIO()
+        with mock.patch(
+            "trans.voice_for_language", return_value="/fake/v.onnx"
+        ), mock.patch("trans.subprocess.Popen") as popen:
+            popen.return_value.wait.return_value = 0
+            self.assertTrue(speak("hi", "ru", debug=True, stderr=err))
+        argv = popen.call_args[0][0]
+        printed = err.getvalue()
+        self.assertIn("/home/k/.local/sbin/piper", printed)
+        self.assertIn("--cuda", printed)
+        self.assertIn("/fake/v.onnx", printed)
+        self.assertIn("<<< hi", printed)  # stdin text shown as heredoc
+        self.assertEqual(argv[-1], "/fake/v.onnx")
+
+    def test_voice_download_prints_download_commands(self):
+        err = io.StringIO()
+        listing = mock.MagicMock()
+        listing.returncode = 0
+        listing.stdout = "es_ES-davefx-medium\n"
+        download = mock.MagicMock()
+        download.returncode = 0
+        target_dir_box: list = []
+
+        def fake_run(cmd, **kwargs):
+            # listing first, then the download makes the file appear
+            if cmd == [trans.DOWNLOAD_VOICES]:
+                return listing
+            (target_dir_box[0] / "es_ES-davefx-medium.onnx").write_bytes(
+                b"x"
+            )
+            return download
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target_dir_box.append(Path(tmp))
+            with mock.patch.object(trans, "PIPER_DIR", Path(tmp)), \
+                    mock.patch(
+                        "trans.subprocess.run", side_effect=fake_run
+                    ):
+                voice = voice_for_language("es", debug=True, stderr=err)
+        self.assertEqual(
+            voice, str(Path(tmp) / "es_ES-davefx-medium.onnx")
+        )
+        printed = err.getvalue()
+        self.assertIn("download_voices", printed)
+        self.assertIn("--download-dir", printed)
+        self.assertIn("es_ES-davefx-medium", printed)
+
+    def test_chat_request_printed_in_debug(self):
+        err = io.StringIO()
+        ok = mock.MagicMock()
+        ok.read.return_value = json.dumps(
+            {"choices": [{"message": {"role": "assistant",
+                                      "content": "es"}}]}
+        ).encode()
+        ok.__enter__.return_value = ok
+        with mock.patch("trans.urllib.request.urlopen") as up:
+            up.return_value = ok
+            code = detect_language(
+                "http://127.0.0.1:8144", "Hola", debug=True, stderr=err
+            )
+        self.assertEqual(code, "es")
+        printed = err.getvalue()
+        self.assertIn("POST http://127.0.0.1:8144/v1/chat/completions",
+                      printed)
+        self.assertIn("Hola", printed)
+
+    def test_debug_disabled_no_chat_print(self):
+        err = io.StringIO()
+        ok = mock.MagicMock()
+        ok.read.return_value = json.dumps(
+            {"choices": [{"message": {"role": "assistant",
+                                      "content": "es"}}]}
+        ).encode()
+        ok.__enter__.return_value = ok
+        with mock.patch("trans.urllib.request.urlopen") as up:
+            up.return_value = ok
+            detect_language(
+                "http://127.0.0.1:8144", "Hola", debug=False, stderr=err
+            )
+        self.assertEqual(err.getvalue(), "")
 
 
 if __name__ == "__main__":
