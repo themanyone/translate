@@ -185,9 +185,12 @@ def _chat(
     stderr=None,
 ) -> str:
     """One chat completion; returns the stripped assistant content."""
+    # Support both formats: standard chatml and translation Gemma format
+    # First try standard chatml (just a string)
     payload = json.dumps(
         {"messages": [{"role": "user", "content": prompt}]}
     ).encode()
+    
     endpoint = f"{server_url.rstrip('/')}/v1/chat/completions"
     _debug_command(
         f"POST {endpoint}", debug, stderr, input_text=prompt
