@@ -283,7 +283,9 @@ class TestSpeaker(unittest.TestCase):
     def test_speak_russian_voice_for_english_direction(self):
         # direction "en" = English input, so the spoken translation is Russian
         with mock.patch("trans.find_player", return_value="pw-play"), \
-                mock.patch("trans.subprocess.Popen") as popen:
+                mock.patch("trans.subprocess.Popen") as popen, \
+                mock.patch("trans.subprocess.run") as run:
+            run.return_value.returncode = 0
             popen.side_effect = self._fake_procs()
             self.assertTrue(speak("Привет!", "en"))
         piper_argv = popen.call_args_list[0][0][0]
@@ -293,11 +295,17 @@ class TestSpeaker(unittest.TestCase):
             piper_argv[piper_argv.index("--model") + 1],
             "/home/k/.cache/piper/ru_RU-irina-medium.onnx",
         )
-        self.assertEqual(piper_argv[piper_argv.index("-f") + 1], "-")
+        wav_arg = piper_argv[piper_argv.index("-f") + 1]
+        self.assertTrue(wav_arg.endswith(".wav"))
+        run_argv = run.call_args[0][0]
+        self.assertEqual(run_argv[0], "pw-play")
+        self.assertEqual(run_argv[1], wav_arg)
 
     def test_speak_english_voice_for_russian_direction(self):
         with mock.patch("trans.find_player", return_value="pw-play"), \
-                mock.patch("trans.subprocess.Popen") as popen:
+                mock.patch("trans.subprocess.Popen") as popen, \
+                mock.patch("trans.subprocess.run") as run:
+            run.return_value.returncode = 0
             popen.side_effect = self._fake_procs()
             self.assertTrue(speak("Hello!", "ru"))
         piper_argv = popen.call_args_list[0][0][0]
@@ -315,18 +323,44 @@ class TestSpeaker(unittest.TestCase):
         bad_piper.wait.return_value = 1
         with mock.patch("trans.find_player", return_value="pw-play"), \
                 mock.patch("trans.subprocess.Popen") as popen, \
+                mock.patch("trans.subprocess.run"), \
                 mock.patch("sys.stderr"):
             popen.side_effect = [bad_piper, player]
             self.assertFalse(speak("hi", "en"))
 
     def test_speak_feeds_text_to_piper_stdin(self):
         with mock.patch("trans.find_player", return_value="pw-play"), \
-                mock.patch("trans.subprocess.Popen") as popen:
+                mock.patch("trans.subprocess.Popen") as popen, \
+                mock.patch("trans.subprocess.run") as run:
+            run.return_value.returncode = 0
             piper, player = self._fake_procs()
             popen.side_effect = [piper, player]
             self.assertTrue(speak("text here", "en"))
         piper.stdin.write.assert_called_once_with(b"text here")
         piper.stdin.close.assert_called_once()
+
+    def test_speak_cleans_up_temp_wav(self):
+        created: list = []
+
+        class FakeTemp:
+            name = "/tmp/fake-trans.wav"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with mock.patch("trans.find_player", return_value="pw-play"), \
+                mock.patch("trans.subprocess.Popen") as popen, \
+                mock.patch("trans.subprocess.run") as run, \
+                mock.patch("trans.tempfile.NamedTemporaryFile",
+                           side_effect=lambda **kw: (created.append(kw), FakeTemp())[1]), \
+                mock.patch("trans.os.unlink") as unlink:
+            run.return_value.returncode = 0
+            popen.side_effect = self._fake_procs()
+            self.assertTrue(speak("clean me", "en"))
+        unlink.assert_called_once_with("/tmp/fake-trans.wav")
 
 
 class TestCLI(unittest.TestCase):

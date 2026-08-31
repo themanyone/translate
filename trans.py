@@ -16,6 +16,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -256,7 +257,12 @@ def find_player() -> str | None:
 
 
 def speak(text: str, direction: str) -> bool:
-    """Say the translation aloud; False on any failure (never raises)."""
+    """Say the translation aloud; False on any failure (never raises).
+
+    piper writes a WAV to a temp file and the player plays the file:
+    none of pw-play/paplay/aplay on this system accept WAV on stdin,
+    and pw-play rejects "-" and /dev/stdin outright.
+    """
     voice = VOICES["ru" if direction == "en" else "en"]
     player = find_player()
     if player is None:
@@ -265,25 +271,31 @@ def speak(text: str, direction: str) -> bool:
             file=sys.stderr,
         )
         return False
+    wav_path: str | None = None
     try:
+        with tempfile.NamedTemporaryFile(
+            suffix=".wav", delete=False
+        ) as wav_file:
+            wav_path = wav_file.name
         piper_proc = subprocess.Popen(
-            [PIPER, "--cuda", "--model", voice, "-f", "-"],
+            [PIPER, "--cuda", "--model", voice, "-f", wav_path],
             stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-        )
-        player_proc = subprocess.Popen(
-            [player, "-"],
-            stdin=piper_proc.stdout,
         )
         piper_proc.stdin.write(text.encode())
         piper_proc.stdin.close()
-        piper_proc.stdout.close()
         piper_rc = piper_proc.wait()
-        player_rc = player_proc.wait()
-        if piper_rc != 0 or player_rc != 0:
+        if piper_rc != 0:
             print(
-                f"warning: speech pipeline failed "
-                f"(piper={piper_rc}, player={player_rc})",
+                f"warning: speech pipeline failed (piper={piper_rc})",
+                file=sys.stderr,
+            )
+            return False
+        player_rc = subprocess.run(
+            [player, wav_path], check=False
+        ).returncode
+        if player_rc != 0:
+            print(
+                f"warning: speech pipeline failed (player={player_rc})",
                 file=sys.stderr,
             )
             return False
@@ -291,6 +303,12 @@ def speak(text: str, direction: str) -> bool:
     except OSError as err:
         print(f"warning: speech failed: {err}", file=sys.stderr)
         return False
+    finally:
+        if wav_path is not None:
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
 
 
 __version__ = "1.0.0"
