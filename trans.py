@@ -528,10 +528,14 @@ def speak(
         return False
     piper_cmd = [PIPER, "--cuda", "--model", voice]
     _debug_command(piper_cmd, debug, stderr, input_text=text)
+    # piper chatters onnxruntime/CUDA warnings to stderr; only show them
+    # under --debug, where the user is actually diagnosing something.
+    piper_stderr = None if debug else subprocess.DEVNULL
     try:
         piper_proc = subprocess.Popen(
             piper_cmd,
             stdin=subprocess.PIPE,
+            stderr=piper_stderr,
         )
         piper_proc.stdin.write(text.encode())
         piper_proc.stdin.close()

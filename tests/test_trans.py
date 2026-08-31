@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -328,6 +329,27 @@ class TestSpeak(unittest.TestCase):
                 mock.patch("sys.stderr"):
             popen.return_value.wait.return_value = 1
             self.assertFalse(speak("hi", "ru"))
+
+    def test_piper_stderr_suppressed_unless_debug(self):
+        # without --debug piper's noisy onnxruntime warnings are dropped;
+        # with --debug they flow through so problems are diagnosable
+        for debug, expect_capture in ((False, True), (True, False)):
+            with self.subTest(debug=debug):
+                with mock.patch(
+                    "trans.voice_for_language",
+                    return_value="/fake/v.onnx",
+                ), mock.patch("trans.subprocess.Popen") as popen:
+                    popen.return_value.wait.return_value = 0
+                    self.assertTrue(
+                        speak("hi", "ru", debug=debug)
+                    )
+                kwargs = popen.call_args[1]
+                if expect_capture:
+                    self.assertEqual(
+                        kwargs["stderr"], subprocess.DEVNULL
+                    )
+                else:
+                    self.assertIsNone(kwargs["stderr"])
 
     def test_returns_false_on_oserror(self):
         with mock.patch(
