@@ -24,6 +24,10 @@ ln -sf "$PWD/trans.py" ~/.local/bin/trans
 - `trans <phrase...>` - translate one phrase and exit.
 - `trans --no-speak <phrase...>` - print only.
 - `trans --stop-server` - stop the auto-started llama-server.
+- `trans --version` / `trans --help` - version and usage.
+
+Exit codes: 0 on success, 1 on errors, 130 when interrupted with Ctrl+C.
+In interactive mode you can quit with `q`, `quit`, or `exit`, or Ctrl+D.
 
 The app talks to `llama-server` at `127.0.0.1:8144` (override with
 `--host`/`--port`). By default it auto-starts a detached server if none is

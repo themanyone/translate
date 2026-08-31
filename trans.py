@@ -8,6 +8,7 @@ local llama-server hosting TranslateGemma 4B; speech uses piper TTS.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -118,7 +119,8 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8144
 
 MODEL_PATH = (
-    "/home/k/.cache/huggingface/hub/models--mradermacher--translategemma-4b-it-i1-GGUF/"
+    "/home/k/.cache/huggingface/hub/"  # noqa: E501
+    "models--mradermacher--translategemma-4b-it-i1-GGUF/"
     "snapshots/ffb12df0e4a6d7a4c500376b1d6a66d73409e085/"
     "translategemma-4b-it.i1-IQ4_NL.gguf"
 )
@@ -185,6 +187,21 @@ def _start_server_detached(host: str, port: int, state_dir: Path) -> int:
     return process.pid
 
 
+def _acquire_start_lock(state_dir: Path) -> int | None:
+    """Hold an exclusive lock for the check-then-spawn window.
+
+    Returns the open lock fd, or None if another trans instance is
+    already mid-start (we then wait for the server, not the lock).
+    """
+    state_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        lock_fd = os.open(state_dir / "start.lock", os.O_CREAT | os.O_RDWR)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock_fd
+    except OSError:
+        return None
+
+
 def ensure_server(
     host: str,
     port: int,
@@ -197,7 +214,9 @@ def ensure_server(
     if _server_is_healthy(health_url(host, port)):
         return url
     if not auto_start:
-        cmd_line = " ".join(shlex.quote(part) for part in server_command(host, port))
+        cmd_line = " ".join(
+            shlex.quote(part) for part in server_command(host, port)
+        )
         print(
             f"translation server is not running at {url}\n"
             f"start it with:\n  {cmd_line}",
@@ -205,13 +224,27 @@ def ensure_server(
         )
         raise TranslateError("translation server unavailable")
     print("starting llama-server (first load takes a while)...", file=out)
-    _start_server_detached(host, port, STATE_DIR)
-    if not wait_for_server(health_url(host, port)):
-        print(
-            f"server did not become healthy; see {STATE_DIR / 'server.log'}",
-            file=out,
-        )
-        raise TranslateError("translation server failed to start")
+    lock_fd = _acquire_start_lock(STATE_DIR)
+    try:
+        # Re-check under the lock: a racing instance may have just
+        # started a healthy server (or our earlier check may be stale).
+        if _server_is_healthy(health_url(host, port)):
+            return url
+        if lock_fd is not None:
+            # We hold the lock: we are the instance that spawns the server.
+            _start_server_detached(host, port, STATE_DIR)
+        # Either we spawned it or another instance is starting it now;
+        # in both cases, wait for the health endpoint.
+        if not wait_for_server(health_url(host, port)):
+            print(
+                f"server did not become healthy; "
+                f"see {STATE_DIR / 'server.log'}",
+                file=out,
+            )
+            raise TranslateError("translation server failed to start")
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
     return url
 
 
@@ -225,15 +258,29 @@ def stop_server(state_dir: Path | None = None) -> bool:
         pid = int(pid_file.read_text().splitlines()[0])
         os.kill(pid, signal.SIGTERM)
     except (ValueError, ProcessLookupError, PermissionError):
+        # Recorded process is gone (crash/reboot): clear the stale record.
+        try:
+            pid_file.unlink()
+        except OSError:
+            pass
         return False
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
+            try:
+                pid_file.unlink()
+            except OSError:
+                pass
             return True
         time.sleep(0.5)
-    return False
+    os.kill(pid, signal.SIGKILL)
+    try:
+        pid_file.unlink()
+    except OSError:
+        pass
+    return True
 
 
 PIPER = "/home/k/.local/sbin/piper"
@@ -348,17 +395,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def resolve_server_url(
     args: argparse.Namespace, env: dict[str, str]
-) -> tuple[str, bool]:
-    """Figure out which server to use and whether we may auto-start it."""
+) -> tuple[str, str | None, bool]:
+    """Return (external_url, host, port, auto_start);
+
+    external_url is non-None only when TRANS_SERVER_URL points at a server
+    whose lifecycle we must never manage.
+    """
     external = env.get("TRANS_SERVER_URL", "").strip()
     if external:
-        # External server: never try to manage its lifecycle.
-        return external.rstrip("/"), False
+        return external.rstrip("/"), None, False
     auto_start = env.get("TRANS_AUTO_START", "1").strip() != "0"
-    return chat_url(args.host, args.port), auto_start
+    return None, (args.host, args.port), auto_start
 
 
-def translate_once(text: str, server_url: str, speak_flag: bool, stdout=None) -> None:
+def translate_once(
+    text: str, server_url: str, speak_flag: bool, stdout=None
+) -> None:
     direction = detect_direction(text)
     if direction is None:
         return
@@ -393,14 +445,28 @@ def run_repl(server_url: str, speak_flag: bool, stdout=None) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     if args.stop:
+        if args.phrase:
+            print(
+                "error: --stop-server takes no other arguments",
+                file=sys.stderr,
+            )
+            return 1
         if stop_server():
             print("server stopped")
             return 0
         print("no recorded server to stop", file=sys.stderr)
         return 1
-    server_url, auto_start = resolve_server_url(args, dict(os.environ))
+    external_url, host_port, auto_start = resolve_server_url(
+        args, dict(os.environ)
+    )
     try:
-        server_url = ensure_server(args.host, args.port, auto_start)
+        if external_url is not None:
+            server_url = external_url
+        elif host_port is not None:
+            host, port = host_port
+            server_url = ensure_server(host, port, auto_start)
+        else:  # pragma: no cover - resolve_server_url always fills one
+            raise TranslateError("no server configured")
     except TranslateError:
         return 1
     try:

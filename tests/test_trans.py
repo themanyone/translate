@@ -1,14 +1,18 @@
 import io
 import json
-
-
+import os
+import signal
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 from urllib.error import HTTPError, URLError
 
-import trans
-from trans import (
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import trans  # noqa: E402
+from trans import (  # noqa: E402
     TranslateError,
     build_prompt,
     detect_direction,
@@ -32,7 +36,9 @@ class TestDetectDirection(unittest.TestCase):
         self.assertEqual(detect_direction("Hello! My name is Eek."), "en")
 
     def test_cyrillic_input_is_russian(self):
-        self.assertEqual(detect_direction("Здравствуйте. Меня зовут Иик."), "ru")
+        self.assertEqual(
+            detect_direction("Здравствуйте. Меня зовут Иик."), "ru"
+        )
 
     def test_mixed_script_counts_as_russian(self):
         self.assertEqual(detect_direction("call me Иик please"), "ru")
@@ -75,7 +81,11 @@ class TestTranslate(unittest.TestCase):
     def _ok_response(self, content: str) -> mock.MagicMock:
         resp = mock.MagicMock()
         body = json.dumps(
-            {"choices": [{"message": {"role": "assistant", "content": content}}]}
+            {
+                "choices": [
+                    {"message": {"role": "assistant", "content": content}}
+                ]
+            }
         ).encode()
         resp.read.return_value = body
         resp.__enter__.return_value = resp
@@ -116,7 +126,9 @@ class TestTranslate(unittest.TestCase):
 
     def test_retries_once_on_connection_error_then_succeeds(self):
         with mock.patch("trans.urllib.request.urlopen") as up:
-            up.side_effect = [URLError("conn refused"), self._ok_response("Ок.")]
+            up.side_effect = [
+                URLError("conn refused"), self._ok_response("Ок.")
+            ]
             result = translate(self.SERVER, "OK.", "en")
         self.assertEqual(result, "Ок.")
         self.assertEqual(up.call_count, 2)
@@ -183,7 +195,8 @@ class TestServerManager(unittest.TestCase):
         self.assertIn("--temp", cmd)
         self.assertEqual(cmd[cmd.index("--temp") + 1], "0")
         self.assertEqual(
-            cmd[cmd.index("--chat-template-file") + 1], str(trans.TEMPLATE_PATH)
+            cmd[cmd.index("--chat-template-file") + 1],
+            str(trans.TEMPLATE_PATH),
         )
         self.assertEqual(cmd[cmd.index("-m") + 1], trans.MODEL_PATH)
         self.assertIn("--port", cmd)
@@ -251,7 +264,8 @@ class TestServerManager(unittest.TestCase):
         with mock.patch("trans.os.kill", side_effect=record_kill), \
                 mock.patch("trans.time.sleep"), \
                 mock.patch.object(
-                    Path, "read_text", return_value="1234\nllama-server -m x"), \
+                    Path, "read_text",
+                    return_value="1234\nllama-server -m x"), \
                 mock.patch.object(Path, "exists", return_value=True):
             self.assertTrue(stop_server(Path("/tmp/fake-state")))
         # first kill call: SIGTERM to recorded pid; second (probe) raised
@@ -260,6 +274,61 @@ class TestServerManager(unittest.TestCase):
     def test_stop_server_missing_pidfile_returns_false(self):
         with mock.patch.object(Path, "exists", return_value=False):
             self.assertFalse(stop_server(Path("/tmp/fake-state")))
+
+    def test_stop_server_unlinks_stale_pidfile(self):
+        # recorded pid no longer exists -> stop returns False but cleans up
+        with tempfile.TemporaryDirectory() as state:
+            state_dir = Path(state)
+            pid_file = state_dir / "server.pid"
+            pid_file.write_text("999999999\nllama-server -m x\n")
+            with mock.patch("trans.os.kill", side_effect=ProcessLookupError):
+                self.assertFalse(stop_server(state_dir))
+            self.assertFalse(pid_file.exists())
+
+    def test_stop_server_unlinks_pidfile_after_kill(self):
+        kill_calls: list = []
+
+        def record_kill(pid, sig):
+            kill_calls.append((pid, sig))
+            if sig == signal.SIGTERM:
+                return None
+            raise ProcessLookupError()  # probe after SIGTERM says it's gone
+
+        with tempfile.TemporaryDirectory() as state:
+            state_dir = Path(state)
+            pid_file = state_dir / "server.pid"
+            pid_file.write_text("1234\nllama-server -m x\n")
+            with mock.patch("trans.os.kill", side_effect=record_kill), \
+                    mock.patch("trans.time.sleep"):
+                self.assertTrue(stop_server(state_dir))
+            self.assertFalse(pid_file.exists())
+        self.assertEqual(kill_calls[0], (1234, signal.SIGTERM))
+
+    def test_ensure_server_no_spawn_when_lock_held(self):
+        # another instance holds the start lock: this one must not spawn a
+        # second llama-server; it waits for the existing one to be healthy
+        with tempfile.TemporaryDirectory() as state:
+            with mock.patch("trans.STATE_DIR", Path(state)):
+                lock_fd = trans._acquire_start_lock(Path(state))
+                self.assertIsNotNone(lock_fd)
+                try:
+                    with mock.patch(
+                        "trans.urllib.request.urlopen"
+                    ) as up, mock.patch(
+                        "trans.subprocess.Popen"
+                    ) as popen:
+                        # health check fails twice, then server appears
+                        up.side_effect = [
+                            URLError("refused"),   # pre-lock health check
+                            URLError("refused"),   # under-lock re-check
+                            self._health_ok(),     # wait_for_server poll
+                        ]
+                        url = ensure_server(self.HOST, self.PORT,
+                                            auto_start=True)
+                    self.assertEqual(url, "http://127.0.0.1:8144")
+                    popen.assert_not_called()
+                finally:
+                    os.close(lock_fd)
 
 
 class TestSpeaker(unittest.TestCase):
@@ -355,7 +424,8 @@ class TestSpeaker(unittest.TestCase):
                 mock.patch("trans.subprocess.Popen") as popen, \
                 mock.patch("trans.subprocess.run") as run, \
                 mock.patch("trans.tempfile.NamedTemporaryFile",
-                           side_effect=lambda **kw: (created.append(kw), FakeTemp())[1]), \
+                           side_effect=lambda **kw:
+                           (created.append(kw), FakeTemp())[1]), \
                 mock.patch("trans.os.unlink") as unlink:
             run.return_value.returncode = 0
             popen.side_effect = self._fake_procs()
@@ -390,20 +460,22 @@ class TestCLI(unittest.TestCase):
             parse_args(["--bogus", "hi"])
 
     def test_resolve_url_env_override_disables_autostart(self):
-        url, auto = resolve_server_url(
+        external, host_port, auto = resolve_server_url(
             parse_args(["--port", "1234", "hi"]),
             {"TRANS_SERVER_URL": "http://elsewhere:9999"},
         )
-        self.assertEqual(url, "http://elsewhere:9999")
+        self.assertEqual(external, "http://elsewhere:9999")
+        self.assertIsNone(host_port)
         self.assertFalse(auto)
 
     def test_resolve_url_defaults(self):
-        url, auto = resolve_server_url(parse_args(["hi"]), {})
-        self.assertEqual(url, "http://127.0.0.1:8144")
+        external, host_port, auto = resolve_server_url(parse_args(["hi"]), {})
+        self.assertIsNone(external)
+        self.assertEqual(host_port, ("127.0.0.1", 8144))
         self.assertTrue(auto)
 
     def test_resolve_url_autostart_env_off(self):
-        url, auto = resolve_server_url(
+        external, host_port, auto = resolve_server_url(
             parse_args(["hi"]), {"TRANS_AUTO_START": "0"}
         )
         self.assertFalse(auto)
@@ -457,6 +529,12 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(code, 0)
         stop.assert_called_once()
 
+    def test_main_stop_server_rejects_extra_args(self):
+        with mock.patch("trans.stop_server") as stop, \
+                mock.patch("sys.stderr"):
+            self.assertEqual(main(["--stop-server", "hi"]), 1)
+        stop.assert_not_called()
+
     def test_main_one_shot(self):
         with mock.patch("trans.ensure_server", return_value="http://x"), \
                 mock.patch("trans.translate", return_value="Привет!"), \
@@ -467,8 +545,9 @@ class TestCLI(unittest.TestCase):
 
     def test_main_one_shot_error_exits_nonzero(self):
         with mock.patch("trans.ensure_server", return_value="http://x"), \
-                mock.patch("trans.translate",
-                          side_effect=TranslateError("bad")), \
+                mock.patch(
+                    "trans.translate",
+                    side_effect=TranslateError("bad")), \
                 mock.patch("sys.stderr"), \
                 mock.patch("sys.stdout"):
             self.assertEqual(main(["Hello!"]), 1)
@@ -479,7 +558,29 @@ class TestCLI(unittest.TestCase):
                 mock.patch("sys.stderr"):
             self.assertEqual(main(["Hello!"]), 1)
 
+    def test_main_uses_external_url_and_skips_ensure_server(self):
+        # mocks only the network seam: proves the TRANS_SERVER_URL plumbing
+        # actually reaches the HTTP layer (regression test for the
+        # URL-discard bug).
+        ok_body = json.dumps(
+            {"choices": [
+                {"message": {"role": "assistant", "content": "Привет!"}}
+            ]}
+        ).encode()
+        with mock.patch.dict(os.environ,
+                             {"TRANS_SERVER_URL": "http://elsewhere:9999"}), \
+                mock.patch("trans.ensure_server") as ensure, \
+                mock.patch("trans.urllib.request.urlopen") as up, \
+                mock.patch("trans.speak", return_value=True):
+            resp = mock.MagicMock()
+            resp.read.return_value = ok_body
+            resp.__enter__.return_value = resp
+            up.return_value = resp
+            self.assertEqual(main(["Hello!"]), 0)
+        ensure.assert_not_called()
+        self.assertEqual(up.call_args[0][0].full_url,
+                         "http://elsewhere:9999/v1/chat/completions")
+
 
 if __name__ == "__main__":
     unittest.main()
-
