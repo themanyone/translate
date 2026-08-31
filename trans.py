@@ -27,44 +27,11 @@ from pathlib import Path
 # Configuration
 # ---------------------------------------------------------------------------
 
-# ISO 639-1 code -> language name, used to build the translation prompt.
-# Keys include common aliases (ISO 639-2/B three-letter codes) so model
-# answers like "eng" or "rus" resolve too.
-LANGUAGES: dict[str, str] = {
-    "en": "English", "eng": "English",
-    "ru": "Russian", "rus": "Russian",
-    "es": "Spanish", "spa": "Spanish",
-    "fr": "French", "fre": "French", "fra": "French",
-    "de": "German", "ger": "German", "deu": "German",
-    "it": "Italian", "ita": "Italian",
-    "pt": "Portuguese", "por": "Portuguese",
-    "uk": "Ukrainian", "ukr": "Ukrainian",
-    "pl": "Polish", "pol": "Polish",
-    "nl": "Dutch", "nld": "Dutch", "dut": "Dutch",
-    "sv": "Swedish", "swe": "Swedish",
-    "da": "Danish", "dan": "Danish",
-    "fi": "Finnish", "fin": "Finnish",
-    "cs": "Czech", "ces": "Czech", "cze": "Czech",
-    "bg": "Bulgarian", "bul": "Bulgarian",
-    "ar": "Arabic", "ara": "Arabic",
-    "he": "Hebrew", "heb": "Hebrew",
-    "ja": "Japanese", "jpn": "Japanese",
-    "zh": "Chinese", "zho": "Chinese", "chi": "Chinese",
-    "ko": "Korean", "kor": "Korean",
-    "hi": "Hindi", "hin": "Hindi",
-    "tr": "Turkish", "tur": "Turkish",
-    "el": "Greek", "ell": "Greek", "gre": "Greek",
-    "ro": "Romanian", "ron": "Romanian", "rum": "Romanian",
-    "hu": "Hungarian", "hun": "Hungarian",
-    "no": "Norwegian", "nor": "Norwegian",
-    "id": "Indonesian", "ind": "Indonesian",
-    "fa": "Persian", "fas": "Persian", "per": "Persian",
-}
-
-# Output language when --to is not given. English input is special-cased:
-# it flips to Spanish so the app never translates en->en.
+# Output language when --to is not given: DEFAULT_TARGET for any input,
+# SECONDARY_TARGET when the input is English (so it never translates
+# en->en).
 DEFAULT_TARGET = "en"
-ENGLISH_INPUT_TARGET = "es"
+SECONDARY_TARGET = "es"
 
 # llama-server defaults and model files
 DEFAULT_HOST = "127.0.0.1"
@@ -98,6 +65,40 @@ DETECT_PROMPT = (
     "Answer with exactly one word: the ISO 639-1 code "
     "(like fr, de, ru, es) of the language of this text. Text: "
 )
+
+# ISO 639-1 code -> language name, used to build the translation prompt.
+# Keys include common aliases (ISO 639-2/B three-letter codes) so model
+# answers like "eng" or "rus" resolve too.
+LANGUAGES: dict[str, str] = {
+    "en": "English", "eng": "English",
+    "ru": "Russian", "rus": "Russian",
+    "es": "Spanish", "spa": "Spanish",
+    "fr": "French", "fre": "French", "fra": "French",
+    "de": "German", "ger": "German", "deu": "German",
+    "it": "Italian", "ita": "Italian",
+    "pt": "Portuguese", "por": "Portuguese",
+    "uk": "Ukrainian", "ukr": "Ukrainian",
+    "pl": "Polish", "pol": "Polish",
+    "nl": "Dutch", "nld": "Dutch", "dut": "Dutch",
+    "sv": "Swedish", "swe": "Swedish",
+    "da": "Danish", "dan": "Danish",
+    "fi": "Finnish", "fin": "Finnish",
+    "cs": "Czech", "ces": "Czech", "cze": "Czech",
+    "bg": "Bulgarian", "bul": "Bulgarian",
+    "ar": "Arabic", "ara": "Arabic",
+    "he": "Hebrew", "heb": "Hebrew",
+    "ja": "Japanese", "jpn": "Japanese",
+    "zh": "Chinese", "zho": "Chinese", "chi": "Chinese",
+    "ko": "Korean", "kor": "Korean",
+    "hi": "Hindi", "hin": "Hindi",
+    "tr": "Turkish", "tur": "Turkish",
+    "el": "Greek", "ell": "Greek", "gre": "Greek",
+    "ro": "Romanian", "ron": "Romanian", "rum": "Romanian",
+    "hu": "Hungarian", "hun": "Hungarian",
+    "no": "Norwegian", "nor": "Norwegian",
+    "id": "Indonesian", "ind": "Indonesian",
+    "fa": "Persian", "fas": "Persian", "per": "Persian",
+}
 
 _ANSWER_RE = re.compile(r"^[^A-Za-z]*([A-Za-z]{2,3})[^A-Za-z]*$")
 
@@ -153,7 +154,7 @@ def pick_target(source: str, to_lang: str | None) -> str:
     English input flips to Spanish."""
     if to_lang is not None:
         return to_lang
-    return ENGLISH_INPUT_TARGET if source == "en" else DEFAULT_TARGET
+    return SECONDARY_TARGET if source == "en" else DEFAULT_TARGET
 
 
 def build_prompt(text: str, source: str, target: str) -> str:
