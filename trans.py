@@ -8,10 +8,17 @@ local llama-server hosting TranslateGemma 4B; speech uses piper TTS.
 from __future__ import annotations
 
 import json
+import os
 import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 # Direction code -> (source language name, target language name)
 LANG_NAMES: dict[str, tuple[str, str]] = {
@@ -103,3 +110,183 @@ def translate(
             if attempt < max_attempts:
                 time.sleep(0.5)
     raise TranslateError(f"cannot reach translation server: {last_error}")
+
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8144
+
+MODEL_PATH = (
+    "/home/k/.cache/huggingface/hub/models--mradermacher--translategemma-4b-it-i1-GGUF/"
+    "snapshots/ffb12df0e4a6d7a4c500376b1d6a66d73409e085/"
+    "translategemma-4b-it.i1-IQ4_NL.gguf"
+)
+
+TEMPLATE_PATH = Path(__file__).resolve().parent / "translategemma.jinja"
+
+STATE_DIR = (
+    Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")) / "trans"
+).expanduser()
+
+
+def health_url(host: str, port: int) -> str:
+    return f"http://{host}:{port}/health"
+
+
+def chat_url(host: str, port: int) -> str:
+    return f"http://{host}:{port}"
+
+
+def server_command(host: str, port: int) -> list[str]:
+    return [
+        "llama-server",
+        "-m", MODEL_PATH,
+        "--host", host,
+        "--port", str(port),
+        "--no-webui",
+        "--no-jinja",
+        "--chat-template-file", str(TEMPLATE_PATH),
+        "--temp", "0",
+    ]
+
+
+def _server_is_healthy(url: str, timeout: float = 5.0) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return b"ok" in response.read().lower()
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def wait_for_server(url: str, timeout: float = 120.0) -> bool:
+    """Poll the health endpoint until it answers or timeout expires."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _server_is_healthy(url):
+            return True
+        time.sleep(2.0)
+    return False
+
+
+def _start_server_detached(host: str, port: int, state_dir: Path) -> int:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    log_path = state_dir / "server.log"
+    cmd = server_command(host, port)
+    with open(log_path, "ab") as log_file:
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    (state_dir / "server.pid").write_text(f"{process.pid}\n{' '.join(cmd)}\n")
+    return process.pid
+
+
+def ensure_server(
+    host: str,
+    port: int,
+    auto_start: bool,
+    stderr=None,
+) -> str:
+    """Return a healthy server base URL, starting the server if allowed."""
+    out = stderr if stderr is not None else sys.stderr
+    url = chat_url(host, port)
+    if _server_is_healthy(health_url(host, port)):
+        return url
+    if not auto_start:
+        cmd_line = " ".join(shlex.quote(part) for part in server_command(host, port))
+        print(
+            f"translation server is not running at {url}\n"
+            f"start it with:\n  {cmd_line}",
+            file=out,
+        )
+        raise TranslateError("translation server unavailable")
+    print("starting llama-server (first load takes a while)...", file=out)
+    _start_server_detached(host, port, STATE_DIR)
+    if not wait_for_server(health_url(host, port)):
+        print(
+            f"server did not become healthy; see {STATE_DIR / 'server.log'}",
+            file=out,
+        )
+        raise TranslateError("translation server failed to start")
+    return url
+
+
+def stop_server(state_dir: Path | None = None) -> bool:
+    """SIGTERM the server recorded in state_dir/server.pid; True if stopped."""
+    state_dir = state_dir if state_dir is not None else STATE_DIR
+    pid_file = state_dir / "server.pid"
+    if not pid_file.exists():
+        return False
+    try:
+        pid = int(pid_file.read_text().splitlines()[0])
+        os.kill(pid, signal.SIGTERM)
+    except (ValueError, ProcessLookupError, PermissionError):
+        return False
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+PIPER = "/home/k/.local/sbin/piper"
+
+# Output language -> piper voice. Direction "en" means English was typed,
+# so the translation (and speech) is Russian.
+VOICES: dict[str, str] = {
+    "ru": "/home/k/.cache/piper/ru_RU-irina-medium.onnx",
+    "en": "/home/k/.cache/piper/en_US-libritts_r-medium.onnx",
+}
+
+PLAYER_CANDIDATES = ["pw-play", "paplay", "aplay"]
+
+
+def find_player() -> str | None:
+    for candidate in PLAYER_CANDIDATES:
+        path = shutil.which(candidate)
+        if path:
+            return path
+    return None
+
+
+def speak(text: str, direction: str) -> bool:
+    """Say the translation aloud; False on any failure (never raises)."""
+    voice = VOICES["ru" if direction == "en" else "en"]
+    player = find_player()
+    if player is None:
+        print(
+            "warning: no audio player found (pw-play, paplay, aplay)",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        piper_proc = subprocess.Popen(
+            [PIPER, "--cuda", "--model", voice, "-f", "-"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        )
+        player_proc = subprocess.Popen(
+            [player, "-"],
+            stdin=piper_proc.stdout,
+        )
+        piper_proc.stdin.write(text.encode())
+        piper_proc.stdin.close()
+        piper_proc.stdout.close()
+        piper_rc = piper_proc.wait()
+        player_rc = player_proc.wait()
+        if piper_rc != 0 or player_rc != 0:
+            print(
+                f"warning: speech pipeline failed "
+                f"(piper={piper_rc}, player={player_rc})",
+                file=sys.stderr,
+            )
+            return False
+        return True
+    except OSError as err:
+        print(f"warning: speech failed: {err}", file=sys.stderr)
+        return False
