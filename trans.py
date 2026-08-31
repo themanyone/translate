@@ -23,6 +23,10 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
 # Direction code -> (source language name, target language name)
 LANG_NAMES: dict[str, tuple[str, str]] = {
     "en": ("English", "Russian"),
@@ -31,6 +35,39 @@ LANG_NAMES: dict[str, tuple[str, str]] = {
 
 # Any character in the Cyrillic block (plus extensions) marks Russian input.
 _CYRILLIC = re.compile(r"[\u0400-\u04FF]")
+
+# llama-server defaults and model files
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8144
+
+MODEL_PATH = (
+    "/home/k/.cache/huggingface/hub/"
+    "models--mradermacher--translategemma-4b-it-i1-GGUF/"
+    "snapshots/ffb12df0e4a6d7a4c500376b1d6a66d73409e085/"
+    "translategemma-4b-it.i1-IQ4_NL.gguf"
+)
+
+TEMPLATE_PATH = Path(__file__).resolve().parent / "translategemma.jinja"
+
+STATE_DIR = (
+    Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")) / "trans"
+).expanduser()
+
+# Speech: piper TTS binary, voices by output language, players to try.
+# Direction "en" means English was typed, so the spoken translation is
+# Russian (VOICES["ru"]) and vice versa.
+PIPER = "/home/k/.local/sbin/piper"
+
+VOICES: dict[str, str] = {
+    "ru": "/home/k/.cache/piper/ru_RU-irina-medium.onnx",
+    "en": "/home/k/.cache/piper/en_US-libritts_r-medium.onnx",
+}
+
+PLAYER_CANDIDATES = ["pw-play", "paplay", "aplay"]
+
+__version__ = "1.0.0"
+
+# ---------------------------------------------------------------------------
 
 
 def detect_direction(text: str) -> str | None:
@@ -113,23 +150,6 @@ def translate(
             if attempt < max_attempts:
                 time.sleep(0.5)
     raise TranslateError(f"cannot reach translation server: {last_error}")
-
-
-DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8144
-
-MODEL_PATH = (
-    "/home/k/.cache/huggingface/hub/"
-    "models--mradermacher--translategemma-4b-it-i1-GGUF/"
-    "snapshots/ffb12df0e4a6d7a4c500376b1d6a66d73409e085/"
-    "translategemma-4b-it.i1-IQ4_NL.gguf"
-)
-
-TEMPLATE_PATH = Path(__file__).resolve().parent / "translategemma.jinja"
-
-STATE_DIR = (
-    Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")) / "trans"
-).expanduser()
 
 
 def health_url(host: str, port: int) -> str:
@@ -294,18 +314,6 @@ def stop_server(state_dir: Path | None = None) -> bool:
     return True
 
 
-PIPER = "/home/k/.local/sbin/piper"
-
-# Output language -> piper voice. Direction "en" means English was typed,
-# so the translation (and speech) is Russian.
-VOICES: dict[str, str] = {
-    "ru": "/home/k/.cache/piper/ru_RU-irina-medium.onnx",
-    "en": "/home/k/.cache/piper/en_US-libritts_r-medium.onnx",
-}
-
-PLAYER_CANDIDATES = ["pw-play", "paplay", "aplay"]
-
-
 def find_player() -> str | None:
     for candidate in PLAYER_CANDIDATES:
         path = shutil.which(candidate)
@@ -367,9 +375,6 @@ def speak(text: str, direction: str) -> bool:
                 os.unlink(wav_path)
             except OSError:
                 pass
-
-
-__version__ = "1.0.0"
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
