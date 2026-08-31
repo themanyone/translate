@@ -7,6 +7,7 @@ local llama-server hosting TranslateGemma 4B; speech uses piper TTS.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -290,3 +291,115 @@ def speak(text: str, direction: str) -> bool:
     except OSError as err:
         print(f"warning: speech failed: {err}", file=sys.stderr)
         return False
+
+
+__version__ = "1.0.0"
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="trans",
+        description="Translate between English and Russian, "
+        "print and speak it.",
+    )
+    parser.add_argument(
+        "phrase", nargs="*",
+        help="phrase to translate (omit for interactive mode)",
+    )
+    parser.add_argument(
+        "--no-speak", dest="speak_flag", action="store_false",
+        help="print the translation without speaking it",
+    )
+    parser.add_argument(
+        "--host", default=DEFAULT_HOST,
+        help=f"server host (default {DEFAULT_HOST})",
+    )
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_PORT,
+        help=f"server port (default {DEFAULT_PORT})",
+    )
+    parser.add_argument(
+        "--stop-server", dest="stop", action="store_true",
+        help="stop the auto-started llama-server and exit",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"trans {__version__}"
+    )
+    return parser.parse_args(argv)
+
+
+def resolve_server_url(
+    args: argparse.Namespace, env: dict[str, str]
+) -> tuple[str, bool]:
+    """Figure out which server to use and whether we may auto-start it."""
+    external = env.get("TRANS_SERVER_URL", "").strip()
+    if external:
+        # External server: never try to manage its lifecycle.
+        return external.rstrip("/"), False
+    auto_start = env.get("TRANS_AUTO_START", "1").strip() != "0"
+    return chat_url(args.host, args.port), auto_start
+
+
+def translate_once(text: str, server_url: str, speak_flag: bool, stdout=None) -> None:
+    direction = detect_direction(text)
+    if direction is None:
+        return
+    translation = translate(server_url, text, direction)
+    out = stdout if stdout is not None else sys.stdout
+    print(f"{LANG_NAMES[direction][1][:2].lower()}: {translation}", file=out)
+    if speak_flag:
+        speak(translation, direction)
+
+
+def run_repl(server_url: str, speak_flag: bool, stdout=None) -> None:
+    out = stdout if stdout is not None else sys.stdout
+    print("type a phrase in English or Russian; q to quit", file=out)
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            return
+        except KeyboardInterrupt:
+            print(file=out)
+            return
+        if line.strip().lower() in {"q", "exit", "quit"}:
+            return
+        try:
+            translate_once(line, server_url, speak_flag, stdout=out)
+        except TranslateError as err:
+            print(f"error: {err}", file=sys.stderr)
+        except KeyboardInterrupt:
+            print("(interrupted)", file=sys.stderr)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.stop:
+        if stop_server():
+            print("server stopped")
+            return 0
+        print("no recorded server to stop", file=sys.stderr)
+        return 1
+    server_url, auto_start = resolve_server_url(args, dict(os.environ))
+    try:
+        server_url = ensure_server(args.host, args.port, auto_start)
+    except TranslateError:
+        return 1
+    try:
+        if args.phrase:
+            translate_once(" ".join(args.phrase), server_url, args.speak_flag)
+        else:
+            run_repl(server_url, args.speak_flag)
+    except TranslateError as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    except OSError as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

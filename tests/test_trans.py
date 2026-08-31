@@ -1,7 +1,7 @@
 import io
 import json
-import os
-import subprocess
+
+
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -15,10 +15,15 @@ from trans import (
     ensure_server,
     find_player,
     health_url,
+    main,
+    parse_args,
+    resolve_server_url,
+    run_repl,
     server_command,
     speak,
     stop_server,
     translate,
+    translate_once,
 )
 
 
@@ -324,5 +329,123 @@ class TestSpeaker(unittest.TestCase):
         piper.stdin.close.assert_called_once()
 
 
+class TestCLI(unittest.TestCase):
+    def test_parse_args_defaults(self):
+        args = parse_args(["hello", "world"])
+        self.assertEqual(args.phrase, ["hello", "world"])
+        self.assertTrue(args.speak_flag)
+        self.assertEqual(args.host, "127.0.0.1")
+        self.assertEqual(args.port, 8144)
+        self.assertFalse(args.stop)
+
+    def test_parse_args_no_speak(self):
+        self.assertFalse(parse_args(["--no-speak", "hi"]).speak_flag)
+
+    def test_parse_args_port(self):
+        self.assertEqual(parse_args(["--port", "9000", "hi"]).port, 9000)
+
+    def test_parse_args_stop_server(self):
+        self.assertTrue(parse_args(["--stop-server"]).stop)
+
+    def test_parse_args_empty_phrase_is_repl(self):
+        self.assertEqual(parse_args([]).phrase, [])
+
+    def test_parse_args_rejects_unknown_flag(self):
+        with self.assertRaises(SystemExit), \
+                mock.patch("sys.stderr"):
+            parse_args(["--bogus", "hi"])
+
+    def test_resolve_url_env_override_disables_autostart(self):
+        url, auto = resolve_server_url(
+            parse_args(["--port", "1234", "hi"]),
+            {"TRANS_SERVER_URL": "http://elsewhere:9999"},
+        )
+        self.assertEqual(url, "http://elsewhere:9999")
+        self.assertFalse(auto)
+
+    def test_resolve_url_defaults(self):
+        url, auto = resolve_server_url(parse_args(["hi"]), {})
+        self.assertEqual(url, "http://127.0.0.1:8144")
+        self.assertTrue(auto)
+
+    def test_resolve_url_autostart_env_off(self):
+        url, auto = resolve_server_url(
+            parse_args(["hi"]), {"TRANS_AUTO_START": "0"}
+        )
+        self.assertFalse(auto)
+
+    def test_translate_once_prints_output_language_prefix(self):
+        out = io.StringIO()
+        with mock.patch("trans.translate", return_value="Привет!"), \
+                mock.patch("trans.speak", return_value=True) as sp:
+            translate_once("Hello!", "http://x", True, stdout=out)
+        self.assertEqual(out.getvalue(), "ru: Привет!\n")
+        sp.assert_called_once_with("Привет!", "en")
+
+    def test_translate_once_no_speak(self):
+        out = io.StringIO()
+        with mock.patch("trans.translate", return_value="Hello."), \
+                mock.patch("trans.speak") as sp:
+            translate_once("Привет.", "http://x", False, stdout=out)
+        self.assertEqual(out.getvalue(), "en: Hello.\n")
+        sp.assert_not_called()
+
+    def test_translate_once_blank_input_noop(self):
+        out = io.StringIO()
+        with mock.patch("trans.translate") as tr:
+            translate_once("   ", "http://x", True, stdout=out)
+        tr.assert_not_called()
+        self.assertEqual(out.getvalue(), "")
+
+    def test_run_repl_translates_lines_until_quit(self):
+        out = io.StringIO()
+        with mock.patch("trans.translate", return_value="Привет!"), \
+                mock.patch("trans.speak", return_value=True), \
+                mock.patch("builtins.input",
+                           side_effect=["Hello!", "   ", "q"]):
+            run_repl("http://x", True, stdout=out)
+        self.assertEqual(out.getvalue().count("ru: Привет!\n"), 1)
+
+    def test_run_repl_survives_translate_error(self):
+        out = io.StringIO()
+        with mock.patch("trans.translate",
+                        side_effect=TranslateError("boom")), \
+                mock.patch("trans.speak"), \
+                mock.patch("builtins.input",
+                           side_effect=["Hello!", "q"]), \
+                mock.patch("sys.stderr"):
+            run_repl("http://x", True, stdout=out)
+
+    def test_main_stop_server(self):
+        with mock.patch("trans.stop_server", return_value=True) as stop, \
+                mock.patch("sys.stdout"):
+            code = main(["--stop-server"])
+        self.assertEqual(code, 0)
+        stop.assert_called_once()
+
+    def test_main_one_shot(self):
+        with mock.patch("trans.ensure_server", return_value="http://x"), \
+                mock.patch("trans.translate", return_value="Привет!"), \
+                mock.patch("trans.speak", return_value=True), \
+                mock.patch("sys.stdout"):
+            code = main(["Hello!"])
+        self.assertEqual(code, 0)
+
+    def test_main_one_shot_error_exits_nonzero(self):
+        with mock.patch("trans.ensure_server", return_value="http://x"), \
+                mock.patch("trans.translate",
+                          side_effect=TranslateError("bad")), \
+                mock.patch("sys.stderr"), \
+                mock.patch("sys.stdout"):
+            self.assertEqual(main(["Hello!"]), 1)
+
+    def test_main_fatal_error_returns_one(self):
+        with mock.patch("trans.ensure_server",
+                        side_effect=TranslateError("no server")), \
+                mock.patch("sys.stderr"):
+            self.assertEqual(main(["Hello!"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
+
