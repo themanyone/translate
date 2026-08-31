@@ -304,6 +304,22 @@ class TestServerManager(unittest.TestCase):
             self.assertFalse(pid_file.exists())
         self.assertEqual(kill_calls[0], (1234, signal.SIGTERM))
 
+    def test_acquire_start_lock_closes_fd_on_contention(self):
+        # loser must not leak the lock fd while waiting for the other
+        # instance
+        with tempfile.TemporaryDirectory() as state:
+            state_dir = Path(state)
+            holder = trans._acquire_start_lock(state_dir)
+            self.assertIsNotNone(holder)
+            try:
+                before = len(os.listdir("/proc/self/fd"))
+                for _ in range(3):
+                    self.assertIsNone(trans._acquire_start_lock(state_dir))
+                after = len(os.listdir("/proc/self/fd"))
+                self.assertEqual(before, after)
+            finally:
+                os.close(holder)
+
     def test_ensure_server_no_spawn_when_lock_held(self):
         # another instance holds the start lock: this one must not spawn a
         # second llama-server; it waits for the existing one to be healthy
@@ -571,6 +587,7 @@ class TestCLI(unittest.TestCase):
                              {"TRANS_SERVER_URL": "http://elsewhere:9999"}), \
                 mock.patch("trans.ensure_server") as ensure, \
                 mock.patch("trans.urllib.request.urlopen") as up, \
+                mock.patch("sys.stdout"), \
                 mock.patch("trans.speak", return_value=True):
             resp = mock.MagicMock()
             resp.read.return_value = ok_body

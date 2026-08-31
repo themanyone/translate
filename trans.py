@@ -119,7 +119,7 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8144
 
 MODEL_PATH = (
-    "/home/k/.cache/huggingface/hub/"  # noqa: E501
+    "/home/k/.cache/huggingface/hub/"
     "models--mradermacher--translategemma-4b-it-i1-GGUF/"
     "snapshots/ffb12df0e4a6d7a4c500376b1d6a66d73409e085/"
     "translategemma-4b-it.i1-IQ4_NL.gguf"
@@ -196,9 +196,13 @@ def _acquire_start_lock(state_dir: Path) -> int | None:
     state_dir.mkdir(parents=True, exist_ok=True)
     try:
         lock_fd = os.open(state_dir / "start.lock", os.O_CREAT | os.O_RDWR)
+    except OSError:
+        return None
+    try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return lock_fd
     except OSError:
+        os.close(lock_fd)  # contention: close, let the other instance win
         return None
 
 
@@ -257,12 +261,15 @@ def stop_server(state_dir: Path | None = None) -> bool:
     try:
         pid = int(pid_file.read_text().splitlines()[0])
         os.kill(pid, signal.SIGTERM)
-    except (ValueError, ProcessLookupError, PermissionError):
+    except (ValueError, ProcessLookupError):
         # Recorded process is gone (crash/reboot): clear the stale record.
         try:
             pid_file.unlink()
         except OSError:
             pass
+        return False
+    except PermissionError:
+        # Process exists but belongs to another user; leave the record.
         return False
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
@@ -275,11 +282,15 @@ def stop_server(state_dir: Path | None = None) -> bool:
                 pass
             return True
         time.sleep(0.5)
-    os.kill(pid, signal.SIGKILL)
     try:
-        pid_file.unlink()
-    except OSError:
-        pass
+        os.kill(pid, signal.SIGKILL)  # stubborn server: force
+    except (ProcessLookupError, PermissionError):
+        pass  # died between probe and SIGKILL
+    finally:
+        try:
+            pid_file.unlink()
+        except OSError:
+            pass
     return True
 
 
@@ -395,11 +406,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def resolve_server_url(
     args: argparse.Namespace, env: dict[str, str]
-) -> tuple[str, str | None, bool]:
-    """Return (external_url, host, port, auto_start);
+) -> tuple[str, tuple[str, int] | None, bool]:
+    """Return (external_url, host_port, auto_start).
 
     external_url is non-None only when TRANS_SERVER_URL points at a server
-    whose lifecycle we must never manage.
+    whose lifecycle we must never manage; host_port is None in that case.
     """
     external = env.get("TRANS_SERVER_URL", "").strip()
     if external:
