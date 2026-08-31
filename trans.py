@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""trans - English<->Russian translator that prints and speaks the result.
+"""trans - translator that prints and speaks the result.
 
-Direction is auto-detected (Cyrillic script check). Translation runs on a
-local llama-server hosting TranslateGemma 4B; speech uses piper TTS.
+Input language is detected with the running translation model (or forced
+with --from). Output defaults to English; English input defaults to
+Spanish instead; --to overrides. Speech uses piper TTS, which plays the
+audio itself.
 """
 
 from __future__ import annotations
@@ -13,11 +15,9 @@ import json
 import os
 import re
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -27,14 +27,44 @@ from pathlib import Path
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Direction code -> (source language name, target language name)
-LANG_NAMES: dict[str, tuple[str, str]] = {
-    "en": ("English", "Russian"),
-    "ru": ("Russian", "English"),
+# ISO 639-1 code -> language name, used to build the translation prompt.
+# Keys include common aliases (ISO 639-2/B three-letter codes) so model
+# answers like "eng" or "rus" resolve too.
+LANGUAGES: dict[str, str] = {
+    "en": "English", "eng": "English",
+    "ru": "Russian", "rus": "Russian",
+    "es": "Spanish", "spa": "Spanish",
+    "fr": "French", "fre": "French", "fra": "French",
+    "de": "German", "ger": "German", "deu": "German",
+    "it": "Italian", "ita": "Italian",
+    "pt": "Portuguese", "por": "Portuguese",
+    "uk": "Ukrainian", "ukr": "Ukrainian",
+    "pl": "Polish", "pol": "Polish",
+    "nl": "Dutch", "nld": "Dutch", "dut": "Dutch",
+    "sv": "Swedish", "swe": "Swedish",
+    "da": "Danish", "dan": "Danish",
+    "fi": "Finnish", "fin": "Finnish",
+    "cs": "Czech", "ces": "Czech", "cze": "Czech",
+    "bg": "Bulgarian", "bul": "Bulgarian",
+    "ar": "Arabic", "ara": "Arabic",
+    "he": "Hebrew", "heb": "Hebrew",
+    "ja": "Japanese", "jpn": "Japanese",
+    "zh": "Chinese", "zho": "Chinese", "chi": "Chinese",
+    "ko": "Korean", "kor": "Korean",
+    "hi": "Hindi", "hin": "Hindi",
+    "tr": "Turkish", "tur": "Turkish",
+    "el": "Greek", "ell": "Greek", "gre": "Greek",
+    "ro": "Romanian", "ron": "Romanian", "rum": "Romanian",
+    "hu": "Hungarian", "hun": "Hungarian",
+    "no": "Norwegian", "nor": "Norwegian",
+    "id": "Indonesian", "ind": "Indonesian",
+    "fa": "Persian", "fas": "Persian", "per": "Persian",
 }
 
-# Any character in the Cyrillic block (plus extensions) marks Russian input.
-_CYRILLIC = re.compile(r"[\u0400-\u04FF]")
+# Output language when --to is not given. English input is special-cased:
+# it flips to Spanish so the app never translates en->en.
+DEFAULT_TARGET = "en"
+ENGLISH_INPUT_TARGET = "es"
 
 # llama-server defaults and model files
 DEFAULT_HOST = "127.0.0.1"
@@ -53,40 +83,73 @@ STATE_DIR = (
     Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")) / "trans"
 ).expanduser()
 
-# Speech: piper TTS binary, voices by output language, players to try.
-# Direction "en" means English was typed, so the spoken translation is
-# Russian (VOICES["ru"]) and vice versa.
+# Speech: piper TTS. The binary plays the synthesized audio itself, so no
+# output file or separate player is needed.
 PIPER = "/home/k/.local/sbin/piper"
-
-VOICES: dict[str, str] = {
-    "ru": "/home/k/.cache/piper/ru_RU-irina-medium.onnx",
-    "en": "/home/k/.cache/piper/en_US-libritts_r-medium.onnx",
+PIPER_DIR = Path("/home/k/.cache/piper")
+DOWNLOAD_VOICES = "/home/k/.local/sbin/download_voices"
+PREFERRED_VOICES: dict[str, str] = {
+    "en": "en_US-libritts_r-medium",
+    "ru": "ru_RU-irina-medium",
 }
 
-PLAYER_CANDIDATES = ["pw-play", "paplay", "aplay"]
+# Prompt used to identify the input language via the running model.
+DETECT_PROMPT = (
+    "Answer with exactly one word: the ISO 639-1 code "
+    "(like fr, de, ru, es) of the language of this text. Text: "
+)
 
-__version__ = "1.0.0"
+_ANSWER_RE = re.compile(r"^[^A-Za-z]*([A-Za-z]{2,3})[^A-Za-z]*$")
+
+__version__ = "1.1.0"
 
 # ---------------------------------------------------------------------------
 
 
-def detect_direction(text: str) -> str | None:
-    """Return "en" (English input) or "ru" (Russian input); None if empty."""
-    if not text.strip():
-        return None
-    return "ru" if _CYRILLIC.search(text) else "en"
+class TranslateError(RuntimeError):
+    """Translation failed; str(exc) is safe to show the user."""
 
 
-def build_prompt(text: str, direction: str) -> str:
+def resolve_language(spec: str) -> str:
+    """Map a language name, 639-1 code, or 639-2 alias to a 639-1 code."""
+    key = spec.strip().lower()
+    if not key:
+        raise ValueError("empty language spec")
+    if key in LANGUAGES:
+        code = key
+    else:
+        matches = [k for k, v in LANGUAGES.items()
+                   if v.lower() == key and len(k) == 2]
+        if not matches:
+            raise ValueError(f"unknown language: {spec!r}")
+        code = matches[0]
+    if len(code) != 2:
+        code = next(k for k, v in LANGUAGES.items()
+                    if v == LANGUAGES[code] and len(k) == 2)
+    return code
+
+
+def pick_target(source: str, to_lang: str | None) -> str:
+    """Choose the output language: explicit --to, else English, except
+    English input flips to Spanish."""
+    if to_lang is not None:
+        return to_lang
+    return ENGLISH_INPUT_TARGET if source == "en" else DEFAULT_TARGET
+
+
+def build_prompt(text: str, source: str, target: str) -> str:
     """Build the instruction prompt that yields a bare translation.
 
     The long form matters: short prompts make the model offer multiple
     translation options with commentary instead of just translating.
     """
     try:
-        source_name, target_name = LANG_NAMES[direction]
+        source_name = LANGUAGES[source]
+        target_name = LANGUAGES[target]
     except KeyError:
-        raise ValueError(f"unknown direction: {direction!r}") from None
+        raise ValueError(
+            f"unsupported language pair: {source}->{target}"
+        ) from None
     return (
         f"Translate the following {source_name} text into {target_name}. "
         f"Produce only the {target_name} translation, without any additional "
@@ -94,40 +157,32 @@ def build_prompt(text: str, direction: str) -> str:
     )
 
 
-class TranslateError(RuntimeError):
-    """Translation failed; str(exc) is safe to show the user."""
+def _chat(server_url: str, prompt: str, timeout: float = 180.0) -> str:
+    """One chat completion; returns the stripped assistant content."""
+    payload = json.dumps(
+        {"messages": [{"role": "user", "content": prompt}]}
+    ).encode()
+    request = urllib.request.Request(
+        f"{server_url.rstrip('/')}/v1/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        body = json.loads(response.read().decode())
+    return body["choices"][0]["message"]["content"].strip()
 
 
-def translate(
+def _chat_with_retry(
     server_url: str,
-    text: str,
-    direction: str,
+    prompt: str,
     timeout: float = 180.0,
     max_attempts: int = 2,
 ) -> str:
-    """Send the translation prompt to llama-server, return bare translation."""
-    payload = json.dumps(
-        {
-            "messages": [
-                {"role": "user", "content": build_prompt(text, direction)}
-            ]
-        }
-    ).encode()
     last_error: Exception | None = None
     for attempt in range(1, max_attempts + 1):
-        request = urllib.request.Request(
-            f"{server_url.rstrip('/')}/v1/chat/completions",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                body = json.loads(response.read().decode())
-            content = body["choices"][0]["message"]["content"].strip()
-            if not content:
-                raise TranslateError("the model returned an empty translation")
-            return content
+            return _chat(server_url, prompt, timeout)
         except urllib.error.HTTPError as err:
             detail = ""
             try:
@@ -151,6 +206,39 @@ def translate(
                 time.sleep(0.5)
     raise TranslateError(f"cannot reach translation server: {last_error}")
 
+
+def detect_language(server_url: str, text: str) -> str:
+    """Ask the running model for the input text's ISO 639-1 code."""
+    if not text.strip():
+        raise TranslateError("nothing to detect in empty input")
+    answer = _chat_with_retry(server_url, DETECT_PROMPT + text.strip())
+    match = _ANSWER_RE.match(answer)
+    if not match:
+        raise TranslateError(f"could not detect language: {answer!r}")
+    try:
+        return resolve_language(match.group(1))
+    except ValueError as err:
+        raise TranslateError(f"could not detect language: {answer!r}") from err
+
+
+def translate(
+    server_url: str,
+    text: str,
+    source: str,
+    target: str,
+    timeout: float = 180.0,
+    max_attempts: int = 2,
+) -> str:
+    """Send the translation prompt to llama-server, return bare translation."""
+    content = _chat_with_retry(
+        server_url, build_prompt(text, source, target), timeout, max_attempts
+    )
+    if not content:
+        raise TranslateError("the model returned an empty translation")
+    return content
+
+
+# --- server manager --------------------------------------------------------
 
 def health_url(host: str, port: int) -> str:
     return f"http://{host}:{port}/health"
@@ -314,37 +402,69 @@ def stop_server(state_dir: Path | None = None) -> bool:
     return True
 
 
-def find_player() -> str | None:
-    for candidate in PLAYER_CANDIDATES:
-        path = shutil.which(candidate)
-        if path:
-            return path
+# --- speech ----------------------------------------------------------------
+
+def voice_for_language(lang: str) -> str | None:
+    """Find a piper voice file for an output language.
+
+    Preferred voices first, then any {lang}_* file already downloaded,
+    then download_voices listing + download of the first match.
+    """
+    preferred = PREFERRED_VOICES.get(lang)
+    if preferred:
+        path = PIPER_DIR / f"{preferred}.onnx"
+        if path.exists():
+            return str(path)
+    existing = sorted(PIPER_DIR.glob(f"{lang}_*.onnx"))
+    if existing:
+        return str(existing[0])
+    # Not on disk: consult download_voices for the first matching voice.
+    try:
+        listing = subprocess.run(
+            [DOWNLOAD_VOICES], capture_output=True, text=True, timeout=60
+        )
+    except (OSError, subprocess.TimeoutExpired) as err:
+        print(f"warning: cannot list voices: {err}", file=sys.stderr)
+        return None
+    if listing.returncode != 0:
+        return None
+    for line in listing.stdout.splitlines():
+        name = line.strip()
+        if name.startswith(f"{lang}_"):
+            print(f"downloading voice {name}...", file=sys.stderr)
+            try:
+                result = subprocess.run(
+                    [DOWNLOAD_VOICES, "--download-dir", str(PIPER_DIR),
+                     name],
+                    capture_output=True, text=True, timeout=600,
+                )
+            except (OSError, subprocess.TimeoutExpired) as err:
+                print(f"warning: voice download failed: {err}",
+                      file=sys.stderr)
+                return None
+            if result.returncode == 0 and (
+                PIPER_DIR / f"{name}.onnx"
+            ).exists():
+                return str(PIPER_DIR / f"{name}.onnx")
+            return None
     return None
 
 
-def speak(text: str, direction: str) -> bool:
+def speak(text: str, lang: str) -> bool:
     """Say the translation aloud; False on any failure (never raises).
 
-    piper writes a WAV to a temp file and the player plays the file:
-    none of pw-play/paplay/aplay on this system accept WAV on stdin,
-    and pw-play rejects "-" and /dev/stdin outright.
+    piper plays the audio itself: text goes to its stdin, no output file.
     """
-    voice = VOICES["ru" if direction == "en" else "en"]
-    player = find_player()
-    if player is None:
+    voice = voice_for_language(lang)
+    if voice is None:
         print(
-            "warning: no audio player found (pw-play, paplay, aplay)",
+            f"warning: no piper voice found for language {lang!r}",
             file=sys.stderr,
         )
         return False
-    wav_path: str | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            suffix=".wav", delete=False
-        ) as wav_file:
-            wav_path = wav_file.name
         piper_proc = subprocess.Popen(
-            [PIPER, "--cuda", "--model", voice, "-f", wav_path],
+            [PIPER, "--cuda", "--model", voice],
             stdin=subprocess.PIPE,
         )
         piper_proc.stdin.write(text.encode())
@@ -356,36 +476,31 @@ def speak(text: str, direction: str) -> bool:
                 file=sys.stderr,
             )
             return False
-        player_rc = subprocess.run(
-            [player, wav_path], check=False
-        ).returncode
-        if player_rc != 0:
-            print(
-                f"warning: speech pipeline failed (player={player_rc})",
-                file=sys.stderr,
-            )
-            return False
         return True
     except OSError as err:
         print(f"warning: speech failed: {err}", file=sys.stderr)
         return False
-    finally:
-        if wav_path is not None:
-            try:
-                os.unlink(wav_path)
-            except OSError:
-                pass
 
+
+# --- CLI --------------------------------------------------------------------
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="trans",
-        description="Translate between English and Russian, "
-        "print and speak it.",
+        description="Translate text, print and speak it.",
     )
     parser.add_argument(
         "phrase", nargs="*",
         help="phrase to translate (omit for interactive mode)",
+    )
+    parser.add_argument(
+        "--from", dest="from_lang", metavar="LANG",
+        help="input language (name or code); default: auto-detect",
+    )
+    parser.add_argument(
+        "--to", dest="to_lang", metavar="LANG",
+        help="output language (name or code); default: English, "
+        "or Spanish when the input is English",
     )
     parser.add_argument(
         "--no-speak", dest="speak_flag", action="store_false",
@@ -406,7 +521,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--version", action="version", version=f"trans {__version__}"
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    try:
+        if args.from_lang is not None:
+            args.from_lang = resolve_language(args.from_lang)
+        if args.to_lang is not None:
+            args.to_lang = resolve_language(args.to_lang)
+    except ValueError as err:
+        parser.error(str(err))
+    return args
 
 
 def resolve_server_url(
@@ -425,21 +548,47 @@ def resolve_server_url(
 
 
 def translate_once(
-    text: str, server_url: str, speak_flag: bool, stdout=None
+    text: str,
+    server_url: str,
+    from_lang: str | None,
+    to_lang: str | None,
+    speak_flag: bool,
+    stdout=None,
 ) -> None:
-    direction = detect_direction(text)
-    if direction is None:
+    """Detect (unless told), translate, print, and speak one phrase."""
+    if not text.strip():
         return
-    translation = translate(server_url, text, direction)
+    direction_source = from_lang
+    if direction_source is None:
+        try:
+            direction_source = detect_language(server_url, text)
+        except TranslateError as err:
+            if to_lang is not None:
+                direction_source = None  # cannot detect; --to still known
+                print(f"warning: {err}", file=sys.stderr)
+            else:
+                raise
+    if direction_source is None:
+        # Undetectable input and only --to given: treat source as English
+        # unless the target is English, in which case assume Russian.
+        direction_source = "ru" if to_lang == "en" else "en"
+    target = pick_target(direction_source, to_lang)
+    translation = translate(server_url, text, direction_source, target)
     out = stdout if stdout is not None else sys.stdout
-    print(f"{LANG_NAMES[direction][1][:2].lower()}: {translation}", file=out)
+    print(f"{target}: {translation}", file=out)
     if speak_flag:
-        speak(translation, direction)
+        speak(translation, target)
 
 
-def run_repl(server_url: str, speak_flag: bool, stdout=None) -> None:
+def run_repl(
+    server_url: str,
+    from_lang: str | None,
+    to_lang: str | None,
+    speak_flag: bool,
+    stdout=None,
+) -> None:
     out = stdout if stdout is not None else sys.stdout
-    print("type a phrase in English or Russian; q to quit", file=out)
+    print("type a phrase in any language; q to quit", file=out)
     while True:
         try:
             line = input()
@@ -451,7 +600,9 @@ def run_repl(server_url: str, speak_flag: bool, stdout=None) -> None:
         if line.strip().lower() in {"q", "exit", "quit"}:
             return
         try:
-            translate_once(line, server_url, speak_flag, stdout=out)
+            translate_once(
+                line, server_url, from_lang, to_lang, speak_flag, stdout=out
+            )
         except TranslateError as err:
             print(f"error: {err}", file=sys.stderr)
         except KeyboardInterrupt:
@@ -487,9 +638,16 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     try:
         if args.phrase:
-            translate_once(" ".join(args.phrase), server_url, args.speak_flag)
+            translate_once(
+                " ".join(args.phrase),
+                server_url,
+                args.from_lang,
+                args.to_lang,
+                args.speak_flag,
+            )
         else:
-            run_repl(server_url, args.speak_flag)
+            run_repl(server_url, args.from_lang, args.to_lang,
+                     args.speak_flag)
     except TranslateError as err:
         print(f"error: {err}", file=sys.stderr)
         return 1

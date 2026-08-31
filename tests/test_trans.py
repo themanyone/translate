@@ -1,7 +1,6 @@
 import io
 import json
 import os
-import signal
 import sys
 import tempfile
 import unittest
@@ -15,64 +14,120 @@ import trans  # noqa: E402
 from trans import (  # noqa: E402
     TranslateError,
     build_prompt,
-    detect_direction,
+    detect_language,
     ensure_server,
-    find_player,
     health_url,
     main,
     parse_args,
-    resolve_server_url,
+    pick_target,
+    resolve_language,
     run_repl,
     server_command,
     speak,
     stop_server,
     translate,
     translate_once,
+    voice_for_language,
 )
 
 
-class TestDetectDirection(unittest.TestCase):
-    def test_ascii_input_is_english(self):
-        self.assertEqual(detect_direction("Hello! My name is Eek."), "en")
+class TestResolveLanguage(unittest.TestCase):
+    def test_name_to_code(self):
+        self.assertEqual(resolve_language("English"), "en")
+        self.assertEqual(resolve_language("Russian"), "ru")
+        self.assertEqual(resolve_language("Spanish"), "es")
+        self.assertEqual(resolve_language("french"), "fr")
 
-    def test_cyrillic_input_is_russian(self):
-        self.assertEqual(
-            detect_direction("Здравствуйте. Меня зовут Иик."), "ru"
-        )
+    def test_code_passthrough(self):
+        self.assertEqual(resolve_language("en"), "en")
+        self.assertEqual(resolve_language("RU"), "ru")
 
-    def test_mixed_script_counts_as_russian(self):
-        self.assertEqual(detect_direction("call me Иик please"), "ru")
+    def test_three_letter_alias(self):
+        self.assertEqual(resolve_language("eng"), "en")
+        self.assertEqual(resolve_language("rus"), "ru")
+        self.assertEqual(resolve_language("fre"), "fr")
 
-    def test_empty_input_returns_none(self):
-        self.assertIsNone(detect_direction(""))
+    def test_unknown_raises(self):
+        with self.assertRaises(ValueError):
+            resolve_language("klingon")
 
-    def test_whitespace_only_returns_none(self):
-        self.assertIsNone(detect_direction("   \n\t "))
 
-    def test_empty_after_strip_returns_none(self):
-        self.assertIsNone(detect_direction("  "))
+class TestPickTarget(unittest.TestCase):
+    def test_default_output_is_english(self):
+        self.assertEqual(pick_target("fr", None), "en")
+        self.assertEqual(pick_target("ru", None), "en")
+
+    def test_english_input_defaults_to_spanish(self):
+        self.assertEqual(pick_target("en", None), "es")
+
+    def test_explicit_to_wins(self):
+        self.assertEqual(pick_target("en", "ru"), "ru")
+        self.assertEqual(pick_target("fr", "es"), "es")
 
 
 class TestBuildPrompt(unittest.TestCase):
-    def test_english_to_russian_uses_verbatim_format(self):
+    def test_uses_language_names(self):
         self.assertEqual(
-            build_prompt("Hello! My name is Eek.", "en"),
-            "Translate the following English text into Russian. "
-            "Produce only the Russian translation, without any additional "
-            "explanations or commentary: Hello! My name is Eek.",
+            build_prompt("Hello!", "en", "es"),
+            "Translate the following English text into Spanish. "
+            "Produce only the Spanish translation, without any additional "
+            "explanations or commentary: Hello!",
         )
 
-    def test_russian_to_english_uses_verbatim_format(self):
+    def test_russian_to_english(self):
         self.assertEqual(
-            build_prompt("Привет!", "ru"),
+            build_prompt("Привет!", "ru", "en"),
             "Translate the following Russian text into English. "
             "Produce only the English translation, without any additional "
             "explanations or commentary: Привет!",
         )
 
-    def test_unknown_direction_raises(self):
+    def test_unknown_language_raises(self):
         with self.assertRaises(ValueError):
-            build_prompt("hi", "fr")
+            build_prompt("hi", "en", "xx")
+
+
+class TestDetectLanguage(unittest.TestCase):
+    SERVER = "http://127.0.0.1:8144"
+
+    def _ok(self, content: str) -> mock.MagicMock:
+        resp = mock.MagicMock()
+        body = json.dumps(
+            {"choices": [{"message": {"role": "assistant",
+                                      "content": content}}]}
+        ).encode()
+        resp.read.return_value = body
+        resp.__enter__.return_value = resp
+        return resp
+
+    def test_returns_detected_code(self):
+        with mock.patch("trans.urllib.request.urlopen") as up:
+            up.return_value = self._ok("es")
+            self.assertEqual(
+                detect_language(self.SERVER, "Hola, cómo estás?"), "es"
+            )
+        sent = json.loads(up.call_args[0][0].data)
+        self.assertIn("Hola, cómo estás?", sent["messages"][0]["content"])
+
+    def test_normalizes_three_letter_answer(self):
+        with mock.patch("trans.urllib.request.urlopen") as up:
+            up.return_value = self._ok("eng")
+            self.assertEqual(detect_language(self.SERVER, "Hello"), "en")
+
+    def test_strips_punctuation_from_answer(self):
+        with mock.patch("trans.urllib.request.urlopen") as up:
+            up.return_value = self._ok('"fr".')
+            self.assertEqual(detect_language(self.SERVER, "Bonjour"), "fr")
+
+    def test_unrecognized_answer_raises(self):
+        with mock.patch("trans.urllib.request.urlopen") as up:
+            up.return_value = self._ok("I am not sure")
+            with self.assertRaises(TranslateError):
+                detect_language(self.SERVER, "???")
+
+    def test_empty_text_raises(self):
+        with self.assertRaises(TranslateError):
+            detect_language(self.SERVER, "   ")
 
 
 class TestTranslate(unittest.TestCase):
@@ -81,11 +136,8 @@ class TestTranslate(unittest.TestCase):
     def _ok_response(self, content: str) -> mock.MagicMock:
         resp = mock.MagicMock()
         body = json.dumps(
-            {
-                "choices": [
-                    {"message": {"role": "assistant", "content": content}}
-                ]
-            }
+            {"choices": [{"message": {"role": "assistant",
+                                      "content": content}}]}
         ).encode()
         resp.read.return_value = body
         resp.__enter__.return_value = resp
@@ -104,7 +156,9 @@ class TestTranslate(unittest.TestCase):
     def test_returns_translation_content(self):
         with mock.patch("trans.urllib.request.urlopen") as up:
             up.return_value = self._ok_response("Привет! Меня зовут Ик.")
-            result = translate(self.SERVER, "Hello! My name is Eek.", "en")
+            result = translate(
+                self.SERVER, "Hello! My name is Eek.", "en", "ru"
+            )
         self.assertEqual(result, "Привет! Меня зовут Ик.")
         body = self._assert_request_body(up)
         self.assertEqual(
@@ -112,7 +166,9 @@ class TestTranslate(unittest.TestCase):
             [
                 {
                     "role": "user",
-                    "content": build_prompt("Hello! My name is Eek.", "en"),
+                    "content": build_prompt(
+                        "Hello! My name is Eek.", "en", "ru"
+                    ),
                 }
             ],
         )
@@ -121,7 +177,7 @@ class TestTranslate(unittest.TestCase):
     def test_strips_whitespace_from_content(self):
         with mock.patch("trans.urllib.request.urlopen") as up:
             up.return_value = self._ok_response("  Hello.\n")
-            result = translate(self.SERVER, "Привет.", "ru")
+            result = translate(self.SERVER, "Привет.", "ru", "en")
         self.assertEqual(result, "Hello.")
 
     def test_retries_once_on_connection_error_then_succeeds(self):
@@ -129,7 +185,7 @@ class TestTranslate(unittest.TestCase):
             up.side_effect = [
                 URLError("conn refused"), self._ok_response("Ок.")
             ]
-            result = translate(self.SERVER, "OK.", "en")
+            result = translate(self.SERVER, "OK.", "en", "ru")
         self.assertEqual(result, "Ок.")
         self.assertEqual(up.call_count, 2)
 
@@ -137,7 +193,7 @@ class TestTranslate(unittest.TestCase):
         with mock.patch("trans.urllib.request.urlopen") as up:
             up.side_effect = URLError("conn refused")
             with self.assertRaises(TranslateError):
-                translate(self.SERVER, "OK.", "en")
+                translate(self.SERVER, "OK.", "en", "ru")
         self.assertEqual(up.call_count, 2)
 
     def test_http_error_raises_without_retry(self):
@@ -146,7 +202,7 @@ class TestTranslate(unittest.TestCase):
                 f"{self.SERVER}/v1/chat/completions", 500, "err", {}, None
             )  # type: ignore[arg-type]
             with self.assertRaises(TranslateError):
-                translate(self.SERVER, "OK.", "en")
+                translate(self.SERVER, "OK.", "en", "ru")
         self.assertEqual(up.call_count, 1)
 
     def test_malformed_json_raises_translate_error(self):
@@ -156,13 +212,13 @@ class TestTranslate(unittest.TestCase):
             resp.__enter__.return_value = resp
             up.return_value = resp
             with self.assertRaises(TranslateError):
-                translate(self.SERVER, "OK.", "en")
+                translate(self.SERVER, "OK.", "en", "ru")
 
     def test_empty_content_raises_translate_error(self):
         with mock.patch("trans.urllib.request.urlopen") as up:
             up.return_value = self._ok_response("   ")
             with self.assertRaises(TranslateError):
-                translate(self.SERVER, "OK.", "en")
+                translate(self.SERVER, "OK.", "en", "ru")
 
     def test_missing_choices_raises_translate_error(self):
         with mock.patch("trans.urllib.request.urlopen") as up:
@@ -171,7 +227,115 @@ class TestTranslate(unittest.TestCase):
             resp.__enter__.return_value = resp
             up.return_value = resp
             with self.assertRaises(TranslateError):
-                translate(self.SERVER, "OK.", "en")
+                translate(self.SERVER, "OK.", "en", "ru")
+
+
+class TestVoiceForLanguage(unittest.TestCase):
+    def test_preferred_voice_when_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            piper_dir = Path(tmp)
+            preferred = piper_dir / "en_US-libritts_r-medium.onnx"
+            preferred.write_bytes(b"x")
+            with mock.patch.object(trans, "PIPER_DIR", piper_dir):
+                self.assertEqual(voice_for_language("en"), str(preferred))
+
+    def test_local_glob_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            piper_dir = Path(tmp)
+            other = piper_dir / "de_DE-karlsson-low.onnx"
+            other.write_bytes(b"x")
+            with mock.patch.object(trans, "PIPER_DIR", piper_dir):
+                self.assertEqual(voice_for_language("de"), str(other))
+
+    def test_downloads_first_matching_voice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            piper_dir = Path(tmp)
+            listing = (
+                "en_US-amy-medium\nes_AR-daniela-high\nes_ES-sharvard-medium\n"
+            )
+            downloaded = piper_dir / "es_AR-daniela-high.onnx"
+            downloaded.write_bytes(b"x")
+
+            def fake_run(cmd, **kwargs):
+                if cmd == [trans.DOWNLOAD_VOICES]:
+                    result = mock.MagicMock()
+                    result.returncode = 0
+                    result.stdout = listing
+                    return result
+                if "es_AR-daniela-high" in cmd:
+                    result = mock.MagicMock()
+                    result.returncode = 0
+                    return result
+                raise AssertionError(f"unexpected cmd: {cmd}")
+
+            with mock.patch.object(trans, "PIPER_DIR", piper_dir), \
+                    mock.patch(
+                        "trans.subprocess.run", side_effect=fake_run
+                    ):
+                self.assertEqual(
+                    voice_for_language("es"), str(downloaded)
+                )
+
+    def test_returns_none_when_no_voice_anywhere(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = mock.MagicMock()
+            result.returncode = 0
+            result.stdout = "en_US-amy-medium\n"
+            with mock.patch.object(trans, "PIPER_DIR", Path(tmp)), \
+                    mock.patch(
+                        "trans.subprocess.run", return_value=result
+                    ):
+                self.assertIsNone(voice_for_language("xx"))
+
+
+class TestSpeak(unittest.TestCase):
+    def test_piper_plays_directly_without_output_file(self):
+        # piper speaks by itself now: no -f, no player process
+        with mock.patch(
+            "trans.voice_for_language", return_value="/fake/ru_RU-x.onnx"
+        ) as vf, mock.patch("trans.subprocess.Popen") as popen:
+            popen.return_value.wait.return_value = 0
+            self.assertTrue(speak("Привет!", "ru"))
+        vf.assert_called_once_with("ru")
+        argv = popen.call_args[0][0]
+        self.assertEqual(argv[0], "/home/k/.local/sbin/piper")
+        self.assertIn("--cuda", argv)
+        self.assertEqual(
+            argv[argv.index("--model") + 1], "/fake/ru_RU-x.onnx"
+        )
+        self.assertNotIn("-f", argv)
+
+    def test_feeds_text_to_piper_stdin(self):
+        with mock.patch(
+            "trans.voice_for_language", return_value="/fake/v.onnx"
+        ), mock.patch("trans.subprocess.Popen") as popen:
+            popen.return_value.wait.return_value = 0
+            self.assertTrue(speak("text here", "es"))
+        popen.return_value.stdin.write.assert_called_once_with(
+            b"text here"
+        )
+        popen.return_value.stdin.close.assert_called_once()
+
+    def test_returns_false_without_voice(self):
+        with mock.patch("trans.voice_for_language", return_value=None), \
+                mock.patch("sys.stderr"):
+            self.assertFalse(speak("hi", "xx"))
+
+    def test_returns_false_when_piper_fails(self):
+        with mock.patch(
+            "trans.voice_for_language", return_value="/fake/v.onnx"
+        ), mock.patch("trans.subprocess.Popen") as popen, \
+                mock.patch("sys.stderr"):
+            popen.return_value.wait.return_value = 1
+            self.assertFalse(speak("hi", "ru"))
+
+    def test_returns_false_on_oserror(self):
+        with mock.patch(
+            "trans.voice_for_language", return_value="/fake/v.onnx"
+        ), mock.patch(
+            "trans.subprocess.Popen", side_effect=OSError("boom")
+        ), mock.patch("sys.stderr"):
+            self.assertFalse(speak("hi", "ru"))
 
 
 class TestServerManager(unittest.TestCase):
@@ -252,28 +416,48 @@ class TestServerManager(unittest.TestCase):
         self.assertIn("llama-server", written)
         self.assertIn("8144", written)
 
-    def test_stop_server_sigterms_pid(self):
-        kill_calls: list = []
+    def test_ensure_server_no_spawn_when_lock_held(self):
+        # another instance holds the start lock: this one must not spawn a
+        # second llama-server; it waits for the existing one to be healthy
+        with tempfile.TemporaryDirectory() as state:
+            with mock.patch("trans.STATE_DIR", Path(state)):
+                lock_fd = trans._acquire_start_lock(Path(state))
+                self.assertIsNotNone(lock_fd)
+                try:
+                    with mock.patch(
+                        "trans.urllib.request.urlopen"
+                    ) as up, mock.patch(
+                        "trans.subprocess.Popen"
+                    ) as popen:
+                        up.side_effect = [
+                            URLError("refused"),   # pre-lock health check
+                            URLError("refused"),   # under-lock re-check
+                            self._health_ok(),     # wait_for_server poll
+                        ]
+                        url = ensure_server(self.HOST, self.PORT,
+                                            auto_start=True)
+                    self.assertEqual(url, "http://127.0.0.1:8144")
+                    popen.assert_not_called()
+                finally:
+                    os.close(lock_fd)
 
-        def record_kill(pid, sig):
-            kill_calls.append((pid, sig))
-            if len(kill_calls) == 1:
-                return None
-            raise ProcessLookupError()
-
-        with mock.patch("trans.os.kill", side_effect=record_kill), \
-                mock.patch("trans.time.sleep"), \
-                mock.patch.object(
-                    Path, "read_text",
-                    return_value="1234\nllama-server -m x"), \
-                mock.patch.object(Path, "exists", return_value=True):
-            self.assertTrue(stop_server(Path("/tmp/fake-state")))
-        # first kill call: SIGTERM to recorded pid; second (probe) raised
-        self.assertEqual(kill_calls[0][0], 1234)
-
-    def test_stop_server_missing_pidfile_returns_false(self):
-        with mock.patch.object(Path, "exists", return_value=False):
-            self.assertFalse(stop_server(Path("/tmp/fake-state")))
+    def test_acquire_start_lock_closes_fd_on_contention(self):
+        # loser must not leak the lock fd while waiting for the other
+        # instance
+        with tempfile.TemporaryDirectory() as state:
+            state_dir = Path(state)
+            holder = trans._acquire_start_lock(state_dir)
+            self.assertIsNotNone(holder)
+            try:
+                before = len(os.listdir("/proc/self/fd"))
+                for _ in range(3):
+                    self.assertIsNone(
+                        trans._acquire_start_lock(state_dir)
+                    )
+                after = len(os.listdir("/proc/self/fd"))
+                self.assertEqual(before, after)
+            finally:
+                os.close(holder)
 
     def test_stop_server_unlinks_stale_pidfile(self):
         # recorded pid no longer exists -> stop returns False but cleans up
@@ -290,9 +474,9 @@ class TestServerManager(unittest.TestCase):
 
         def record_kill(pid, sig):
             kill_calls.append((pid, sig))
-            if sig == signal.SIGTERM:
-                return None
-            raise ProcessLookupError()  # probe after SIGTERM says it's gone
+            if sig == 0:
+                raise ProcessLookupError()  # gone after SIGTERM
+            return None
 
         with tempfile.TemporaryDirectory() as state:
             state_dir = Path(state)
@@ -302,151 +486,11 @@ class TestServerManager(unittest.TestCase):
                     mock.patch("trans.time.sleep"):
                 self.assertTrue(stop_server(state_dir))
             self.assertFalse(pid_file.exists())
-        self.assertEqual(kill_calls[0], (1234, signal.SIGTERM))
+        self.assertEqual(kill_calls[0][0], 1234)
 
-    def test_acquire_start_lock_closes_fd_on_contention(self):
-        # loser must not leak the lock fd while waiting for the other
-        # instance
-        with tempfile.TemporaryDirectory() as state:
-            state_dir = Path(state)
-            holder = trans._acquire_start_lock(state_dir)
-            self.assertIsNotNone(holder)
-            try:
-                before = len(os.listdir("/proc/self/fd"))
-                for _ in range(3):
-                    self.assertIsNone(trans._acquire_start_lock(state_dir))
-                after = len(os.listdir("/proc/self/fd"))
-                self.assertEqual(before, after)
-            finally:
-                os.close(holder)
-
-    def test_ensure_server_no_spawn_when_lock_held(self):
-        # another instance holds the start lock: this one must not spawn a
-        # second llama-server; it waits for the existing one to be healthy
-        with tempfile.TemporaryDirectory() as state:
-            with mock.patch("trans.STATE_DIR", Path(state)):
-                lock_fd = trans._acquire_start_lock(Path(state))
-                self.assertIsNotNone(lock_fd)
-                try:
-                    with mock.patch(
-                        "trans.urllib.request.urlopen"
-                    ) as up, mock.patch(
-                        "trans.subprocess.Popen"
-                    ) as popen:
-                        # health check fails twice, then server appears
-                        up.side_effect = [
-                            URLError("refused"),   # pre-lock health check
-                            URLError("refused"),   # under-lock re-check
-                            self._health_ok(),     # wait_for_server poll
-                        ]
-                        url = ensure_server(self.HOST, self.PORT,
-                                            auto_start=True)
-                    self.assertEqual(url, "http://127.0.0.1:8144")
-                    popen.assert_not_called()
-                finally:
-                    os.close(lock_fd)
-
-
-class TestSpeaker(unittest.TestCase):
-    def _fake_procs(self):
-        piper = mock.MagicMock(stdout=mock.MagicMock())
-        player = mock.MagicMock()
-        for p in (piper, player):
-            p.wait.return_value = 0
-        return [piper, player]
-
-    def test_find_player_first_on_path(self):
-        with mock.patch(
-            "trans.shutil.which", side_effect=lambda n: f"/usr/bin/{n}"
-        ):
-            self.assertEqual(find_player(), "/usr/bin/pw-play")
-
-    def test_find_player_none_when_missing(self):
-        with mock.patch("trans.shutil.which", return_value=None):
-            self.assertIsNone(find_player())
-
-    def test_speak_russian_voice_for_english_direction(self):
-        # direction "en" = English input, so the spoken translation is Russian
-        with mock.patch("trans.find_player", return_value="pw-play"), \
-                mock.patch("trans.subprocess.Popen") as popen, \
-                mock.patch("trans.subprocess.run") as run:
-            run.return_value.returncode = 0
-            popen.side_effect = self._fake_procs()
-            self.assertTrue(speak("Привет!", "en"))
-        piper_argv = popen.call_args_list[0][0][0]
-        self.assertEqual(piper_argv[0], "/home/k/.local/sbin/piper")
-        self.assertIn("--cuda", piper_argv)
-        self.assertEqual(
-            piper_argv[piper_argv.index("--model") + 1],
-            "/home/k/.cache/piper/ru_RU-irina-medium.onnx",
-        )
-        wav_arg = piper_argv[piper_argv.index("-f") + 1]
-        self.assertTrue(wav_arg.endswith(".wav"))
-        run_argv = run.call_args[0][0]
-        self.assertEqual(run_argv[0], "pw-play")
-        self.assertEqual(run_argv[1], wav_arg)
-
-    def test_speak_english_voice_for_russian_direction(self):
-        with mock.patch("trans.find_player", return_value="pw-play"), \
-                mock.patch("trans.subprocess.Popen") as popen, \
-                mock.patch("trans.subprocess.run") as run:
-            run.return_value.returncode = 0
-            popen.side_effect = self._fake_procs()
-            self.assertTrue(speak("Hello!", "ru"))
-        piper_argv = popen.call_args_list[0][0][0]
-        self.assertEqual(
-            piper_argv[piper_argv.index("--model") + 1],
-            "/home/k/.cache/piper/en_US-libritts_r-medium.onnx",
-        )
-
-    def test_speak_returns_false_without_player(self):
-        with mock.patch("trans.find_player", return_value=None):
-            self.assertFalse(speak("hi", "en"))
-
-    def test_speak_returns_false_when_piper_fails(self):
-        bad_piper, player = self._fake_procs()
-        bad_piper.wait.return_value = 1
-        with mock.patch("trans.find_player", return_value="pw-play"), \
-                mock.patch("trans.subprocess.Popen") as popen, \
-                mock.patch("trans.subprocess.run"), \
-                mock.patch("sys.stderr"):
-            popen.side_effect = [bad_piper, player]
-            self.assertFalse(speak("hi", "en"))
-
-    def test_speak_feeds_text_to_piper_stdin(self):
-        with mock.patch("trans.find_player", return_value="pw-play"), \
-                mock.patch("trans.subprocess.Popen") as popen, \
-                mock.patch("trans.subprocess.run") as run:
-            run.return_value.returncode = 0
-            piper, player = self._fake_procs()
-            popen.side_effect = [piper, player]
-            self.assertTrue(speak("text here", "en"))
-        piper.stdin.write.assert_called_once_with(b"text here")
-        piper.stdin.close.assert_called_once()
-
-    def test_speak_cleans_up_temp_wav(self):
-        created: list = []
-
-        class FakeTemp:
-            name = "/tmp/fake-trans.wav"
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-        with mock.patch("trans.find_player", return_value="pw-play"), \
-                mock.patch("trans.subprocess.Popen") as popen, \
-                mock.patch("trans.subprocess.run") as run, \
-                mock.patch("trans.tempfile.NamedTemporaryFile",
-                           side_effect=lambda **kw:
-                           (created.append(kw), FakeTemp())[1]), \
-                mock.patch("trans.os.unlink") as unlink:
-            run.return_value.returncode = 0
-            popen.side_effect = self._fake_procs()
-            self.assertTrue(speak("clean me", "en"))
-        unlink.assert_called_once_with("/tmp/fake-trans.wav")
+    def test_stop_server_missing_pidfile_returns_false(self):
+        with mock.patch.object(Path, "exists", return_value=False):
+            self.assertFalse(stop_server(Path("/tmp/fake-state")))
 
 
 class TestCLI(unittest.TestCase):
@@ -457,6 +501,22 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(args.host, "127.0.0.1")
         self.assertEqual(args.port, 8144)
         self.assertFalse(args.stop)
+        self.assertIsNone(args.from_lang)
+        self.assertIsNone(args.to_lang)
+
+    def test_parse_args_from_to(self):
+        args = parse_args(["--from", "Russian", "--to", "Spanish", "hi"])
+        self.assertEqual(args.from_lang, "ru")
+        self.assertEqual(args.to_lang, "es")
+
+    def test_parse_args_from_accepts_code(self):
+        args = parse_args(["--from", "fr", "hi"])
+        self.assertEqual(args.from_lang, "fr")
+
+    def test_parse_args_rejects_unknown_language(self):
+        with self.assertRaises(SystemExit), \
+                mock.patch("sys.stderr"):
+            parse_args(["--to", "klingon", "hi"])
 
     def test_parse_args_no_speak(self):
         self.assertFalse(parse_args(["--no-speak", "hi"]).speak_flag)
@@ -476,7 +536,7 @@ class TestCLI(unittest.TestCase):
             parse_args(["--bogus", "hi"])
 
     def test_resolve_url_env_override_disables_autostart(self):
-        external, host_port, auto = resolve_server_url(
+        external, host_port, auto = trans.resolve_server_url(
             parse_args(["--port", "1234", "hi"]),
             {"TRANS_SERVER_URL": "http://elsewhere:9999"},
         )
@@ -485,58 +545,82 @@ class TestCLI(unittest.TestCase):
         self.assertFalse(auto)
 
     def test_resolve_url_defaults(self):
-        external, host_port, auto = resolve_server_url(parse_args(["hi"]), {})
+        external, host_port, auto = trans.resolve_server_url(
+            parse_args(["hi"]), {}
+        )
         self.assertIsNone(external)
         self.assertEqual(host_port, ("127.0.0.1", 8144))
         self.assertTrue(auto)
 
-    def test_resolve_url_autostart_env_off(self):
-        external, host_port, auto = resolve_server_url(
-            parse_args(["hi"]), {"TRANS_AUTO_START": "0"}
-        )
-        self.assertFalse(auto)
-
     def test_translate_once_prints_output_language_prefix(self):
         out = io.StringIO()
-        with mock.patch("trans.translate", return_value="Привет!"), \
+        with mock.patch("trans.detect_language", return_value="en"), \
+                mock.patch("trans.translate", return_value="¡Hola!"), \
                 mock.patch("trans.speak", return_value=True) as sp:
-            translate_once("Hello!", "http://x", True, stdout=out)
-        self.assertEqual(out.getvalue(), "ru: Привет!\n")
-        sp.assert_called_once_with("Привет!", "en")
+            translate_once(
+                "Hello!", "http://x", None, None, True, stdout=out
+            )
+        self.assertEqual(out.getvalue(), "es: ¡Hola!\n")
+        sp.assert_called_once_with("¡Hola!", "es")
 
-    def test_translate_once_no_speak(self):
+    def test_translate_once_english_defaults_to_spanish(self):
         out = io.StringIO()
-        with mock.patch("trans.translate", return_value="Hello."), \
-                mock.patch("trans.speak") as sp:
-            translate_once("Привет.", "http://x", False, stdout=out)
-        self.assertEqual(out.getvalue(), "en: Hello.\n")
-        sp.assert_not_called()
+        with mock.patch("trans.detect_language", return_value="en"), \
+                mock.patch("trans.translate", return_value="Hola") as tr, \
+                mock.patch("trans.speak"):
+            translate_once(
+                "Hello!", "http://x", None, None, True, stdout=out
+            )
+        tr.assert_called_once_with("http://x", "Hello!", "en", "es")
+
+    def test_translate_once_foreign_defaults_to_english(self):
+        out = io.StringIO()
+        with mock.patch("trans.detect_language", return_value="fr"), \
+                mock.patch("trans.translate", return_value="Hello") as tr, \
+                mock.patch("trans.speak"):
+            translate_once(
+                "Bonjour", "http://x", None, None, True, stdout=out
+            )
+        tr.assert_called_once_with("http://x", "Bonjour", "fr", "en")
+
+    def test_translate_once_explicit_from_skips_detection(self):
+        out = io.StringIO()
+        with mock.patch("trans.detect_language") as det, \
+                mock.patch("trans.translate", return_value="Hello") as tr, \
+                mock.patch("trans.speak"):
+            translate_once(
+                "Bonjour", "http://x", "fr", "de", True, stdout=out
+            )
+        det.assert_not_called()
+        tr.assert_called_once_with("http://x", "Bonjour", "fr", "de")
 
     def test_translate_once_blank_input_noop(self):
         out = io.StringIO()
         with mock.patch("trans.translate") as tr:
-            translate_once("   ", "http://x", True, stdout=out)
+            translate_once("   ", "http://x", None, None, True, stdout=out)
         tr.assert_not_called()
         self.assertEqual(out.getvalue(), "")
 
     def test_run_repl_translates_lines_until_quit(self):
         out = io.StringIO()
-        with mock.patch("trans.translate", return_value="Привет!"), \
+        with mock.patch("trans.detect_language", return_value="en"), \
+                mock.patch("trans.translate", return_value="Hola"), \
                 mock.patch("trans.speak", return_value=True), \
                 mock.patch("builtins.input",
                            side_effect=["Hello!", "   ", "q"]):
-            run_repl("http://x", True, stdout=out)
-        self.assertEqual(out.getvalue().count("ru: Привет!\n"), 1)
+            run_repl("http://x", None, None, True, stdout=out)
+        self.assertEqual(out.getvalue().count("es: Hola\n"), 1)
 
     def test_run_repl_survives_translate_error(self):
         out = io.StringIO()
-        with mock.patch("trans.translate",
-                        side_effect=TranslateError("boom")), \
+        with mock.patch("trans.detect_language", return_value="en"), \
+                mock.patch("trans.translate",
+                           side_effect=TranslateError("boom")), \
                 mock.patch("trans.speak"), \
                 mock.patch("builtins.input",
                            side_effect=["Hello!", "q"]), \
                 mock.patch("sys.stderr"):
-            run_repl("http://x", True, stdout=out)
+            run_repl("http://x", None, None, True, stdout=out)
 
     def test_main_stop_server(self):
         with mock.patch("trans.stop_server", return_value=True) as stop, \
@@ -553,24 +637,36 @@ class TestCLI(unittest.TestCase):
 
     def test_main_one_shot(self):
         with mock.patch("trans.ensure_server", return_value="http://x"), \
-                mock.patch("trans.translate", return_value="Привет!"), \
+                mock.patch("trans.detect_language", return_value="en"), \
+                mock.patch("trans.translate", return_value="¡Hola!"), \
                 mock.patch("trans.speak", return_value=True), \
                 mock.patch("sys.stdout"):
             code = main(["Hello!"])
         self.assertEqual(code, 0)
 
+    def test_main_one_shot_with_from_to(self):
+        with mock.patch("trans.ensure_server", return_value="http://x"), \
+                mock.patch("trans.detect_language") as det, \
+                mock.patch("trans.translate", return_value="Привет"), \
+                mock.patch("trans.speak", return_value=True), \
+                mock.patch("sys.stdout"):
+            code = main(["--from", "English", "--to", "Russian", "Hello!"])
+        self.assertEqual(code, 0)
+        det.assert_not_called()
+
     def test_main_one_shot_error_exits_nonzero(self):
         with mock.patch("trans.ensure_server", return_value="http://x"), \
-                mock.patch(
-                    "trans.translate",
-                    side_effect=TranslateError("bad")), \
+                mock.patch("trans.detect_language", return_value="en"), \
+                mock.patch("trans.translate",
+                           side_effect=TranslateError("bad")), \
                 mock.patch("sys.stderr"), \
                 mock.patch("sys.stdout"):
             self.assertEqual(main(["Hello!"]), 1)
 
     def test_main_fatal_error_returns_one(self):
-        with mock.patch("trans.ensure_server",
-                        side_effect=TranslateError("no server")), \
+        with mock.patch(
+                "trans.ensure_server",
+                side_effect=TranslateError("no server")), \
                 mock.patch("sys.stderr"):
             self.assertEqual(main(["Hello!"]), 1)
 
@@ -583,8 +679,9 @@ class TestCLI(unittest.TestCase):
                 {"message": {"role": "assistant", "content": "Привет!"}}
             ]}
         ).encode()
-        with mock.patch.dict(os.environ,
-                             {"TRANS_SERVER_URL": "http://elsewhere:9999"}), \
+        with mock.patch.dict(
+                os.environ,
+                {"TRANS_SERVER_URL": "http://elsewhere:9999"}), \
                 mock.patch("trans.ensure_server") as ensure, \
                 mock.patch("trans.urllib.request.urlopen") as up, \
                 mock.patch("sys.stdout"), \
@@ -593,10 +690,12 @@ class TestCLI(unittest.TestCase):
             resp.read.return_value = ok_body
             resp.__enter__.return_value = resp
             up.return_value = resp
-            self.assertEqual(main(["Hello!"]), 0)
+            self.assertEqual(main(["--from", "en", "Hello!"]), 0)
         ensure.assert_not_called()
-        self.assertEqual(up.call_args[0][0].full_url,
-                         "http://elsewhere:9999/v1/chat/completions")
+        self.assertEqual(
+            up.call_args[0][0].full_url,
+            "http://elsewhere:9999/v1/chat/completions",
+        )
 
 
 if __name__ == "__main__":
