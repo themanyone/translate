@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""trans - translator that prints and speaks the result.
+"""translate - translator that prints and speaks the result.
 
 Translation runs on llama-server. A router-mode server that is already
 running and hosts a TranslateGemma model (discovered via /v1/models) is
-preferred; requests then select that model by id. Otherwise trans uses
+preferred; requests then select that model by id. Otherwise translate uses
 a dedicated single-model server it can start itself. Input language is
 detected with the running translation model (or forced with --from).
 Output defaults to English; English input defaults to Spanish instead;
@@ -54,7 +54,7 @@ HOME = os.environ.get("HOME", os.environ.get("USERPROFILE", "C:\\Users\\user"))
 
 XDG_STATE_FALLBACK = os.path.join(HOME, ".local", "state")
 STATE_DIR = (
-    Path(os.environ.get("XDG_STATE_HOME", XDG_STATE_FALLBACK)) / "trans"
+    Path(os.environ.get("XDG_STATE_HOME", XDG_STATE_FALLBACK)) / "translate"
 ).expanduser()
 
 # Speech: piper TTS. The binary plays the synthesized audio itself, so no
@@ -315,7 +315,7 @@ def find_router_model(
 
     Probes /v1/models, where a router-mode llama-server lists every
     model it can host. Matches the id containing "translategemma", else
-    an alias of exactly "trans"; None means this server is unusable for
+    an alias of exactly "translate"; None means this server is unusable for
     translation (unreachable, or no TranslateGemma among its models).
     """
     endpoint = f"{server_url.rstrip('/')}/v1/models"
@@ -331,7 +331,7 @@ def find_router_model(
             return entry["id"]
     for entry in entries:
         aliases = [str(alias).lower() for alias in entry.get("aliases") or []]
-        if "trans" in aliases or "translategemma" in aliases:
+        if "translate" in aliases or "translategemma" in aliases:
             return entry["id"]
     return None
 
@@ -403,7 +403,7 @@ def _start_server_detached(
 def _acquire_start_lock(state_dir: Path) -> int | None:
     """Hold an exclusive lock for the check-then-spawn window.
 
-    Returns the open lock fd, or None if another trans instance is
+    Returns the open lock fd, or None if another translate instance is
     already mid-start (we then wait for the server, not the lock).
     """
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -609,7 +609,7 @@ def speak(
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="trans",
+        prog="translate",
         description="Translate text, print and speak it.",
     )
     parser.add_argument(
@@ -654,7 +654,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="stop the auto-started llama-server and exit",
     )
     parser.add_argument(
-        "--version", action="version", version=f"trans {__version__}"
+        "--version", action="version", version=f"translate {__version__}"
     )
     args = parser.parse_args(argv)
     try:
@@ -680,7 +680,7 @@ def resolve_backend(
     model; every request then selects that model by id. Otherwise falls
     back to the dedicated single-model server, auto-starting it when
     TRANS_AUTO_START allows. TRANS_SERVER_URL pins one fixed server
-    whose lifecycle trans never manages; model selection still applies
+    whose lifecycle translate never manages; model selection still applies
     when that server hosts TranslateGemma.
     """
     out = stderr if stderr is not None else sys.stderr
