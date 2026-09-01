@@ -11,12 +11,12 @@
 ## Global Constraints
 
 - **Stdlib only** — no pip dependencies; imports limited to `argparse`, `json`, `os`, `re`, `shutil`, `signal`, `socket`, `subprocess`, `sys`, `time`, `urllib.request`, `urllib.error`, `pathlib`.
-- **Single source file** `trans.py` at repo root; installed as `~/.local/bin/trans` via a symlink (no packaging, no venv).
+- **Single source file** `trans.py` at repo root; installed as `/home/k/.local/bin/trans` via a symlink (no packaging, no venv).
 - **Model paths (verbatim):**
-  - GGUF: `/home/k/.cache/huggingface/hub/models--mradermacher--translategemma-4b-it-i1-GGUF/snapshots/ffb12df0e4a6d7a4c500376b1d6a66d73409e085/translategemma-4b-it.i1-IQ4_NL.gguf`
+  - GGUF: `$HOME/.cache/huggingface/hub/models--mradermacher--translategemma-4b-it-i1-GGUF/snapshots/ffb12df0e4a6d7a4c500376b1d6a66d73409e085/translategemma-4b-it.i1-IQ4_NL.gguf`
   - Chat template: `<repo>/translategemma.jinja`
-- **Piper (verbatim):** binary `/home/k/.local/sbin/piper`, voices `/home/k/.cache/piper/ru_RU-irina-medium.onnx` and `/home/k/.cache/piper/en_US-libritts_r-medium.onnx`, always `--cuda`.
-- **Server:** `llama-server` (on PATH), default `127.0.0.1:8144`, flags `--no-jinja --chat-template-file translategemma.jinja --temp 0`; state dir `~/.local/state/trans/` (`server.log`, `server.pid`).
+- **Piper (verbatim):** binary `$HOME/.local/sbin/piper`, voices `$HOME/.cache/piper/ru_RU-irina-medium.onnx` and `$HOME/.cache/piper/en_US-libritts_r-medium.onnx`, always `--cuda`.
+- **Server:** `llama-server` (on PATH), default `127.0.0.1:8144`, flags `--no-jinja --chat-template-file translategemma.jinja --temp 0`; state dir `/home/k/.local/state/trans/` (`server.log`, `server.pid`).
 - **Prompt format (verbatim)** — user message sent to `/v1/chat/completions`:
   `Translate the following {source_language} text into {target_language}. Produce only the {target_language} translation, without any additional explanations or commentary: {text}`
   where `{source_language}`/`{target_language}` are `English`/`Russian`. This long instruction is what suppresses commentary (verified experimentally; short prompts like `Translate to Russian: …` produce unwanted multi-option explanations).
@@ -396,13 +396,13 @@ git commit -m "feat: add REST translation client for llama-server"
 - Consumes: none new (stdlib only).
 - Produces:
   - `DEFAULT_HOST = "127.0.0.1"`, `DEFAULT_PORT = 8144`
-  - `MODEL_PATH = "/home/k/.cache/huggingface/hub/models--mradermacher--translategemma-4b-it-i1-GGUF/snapshots/ffb12df0e4a6d7a4c500376b1d6a66d73409e085/translategemma-4b-it.i1-IQ4_NL.gguf"`
+  - `MODEL_PATH = "mradermacher/translategemma-4b-it-i1-GGUF:IQ4_NL"`
   - `TEMPLATE_PATH = Path(__file__).resolve().parent / "translategemma.jinja"` — the jinja file sits next to the installed script; when installed via symlink, `__file__` resolves through the symlink to the repo copy (verify in Task 6; if a symlink breaks resolution, `Path(__file__).resolve()` follows it to the real repo file, which is the point).
-  - `STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")) / "trans"` (expanded).
+  - `STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", "/home/k/.local/state")) / "trans"` (expanded).
   - `health_url(host, port) -> str` — `http://{host}:{port}/health`
   - `chat_url(host, port) -> str` — `http://{host}:{port}` (the `translate()` client appends `/v1/chat/completions`)
   - `server_command(host: str, port: int) -> list[str]` — the exact argv for llama-server:
-    `["llama-server", "-m", MODEL_PATH, "--host", host, "--port", str(port), "--no-webui", "--no-jinja", "--chat-template-file", str(TEMPLATE_PATH), "--temp", "0"]`
+    `["llama-server", "-hf", MODEL_PATH, "--host", host, "--port", str(port), "--no-webui", "--no-jinja", "--chat-template-file", str(TEMPLATE_PATH), "--temp", "0"]`
   - `wait_for_server(url: str, timeout: float = 120.0) -> bool` — poll `GET {url}/health` every 2 s; True once the response body contains `"ok"`.
   - `ensure_server(host: str, port: int, auto_start: bool, stderr=sys.stderr) -> str` — returns the base URL to use. If healthy, return it. Else if `auto_start`, launch detached and wait for health; on success return URL, on timeout print log-path hint to `stderr` and raise `TranslateError`. Else (no auto-start) print the exact `server_command()` shell line to `stderr` and raise `TranslateError`.
   - `stop_server(state_dir: Path = STATE_DIR) -> bool` — SIGTERM the pid in `state_dir/server.pid`, wait up to 10 s for exit, return True/False. Missing pidfile → False.
@@ -456,7 +456,7 @@ class TestServerManager(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--temp") + 1], "0")
         self.assertEqual(cmd[cmd.index("--chat-template-file") + 1],
                          str(trans.TEMPLATE_PATH))
-        self.assertEqual(cmd[cmd.index("-m") + 1], trans.MODEL_PATH)
+        self.assertEqual(cmd[cmd.index("-hf") + 1], trans.MODEL_PATH)
         self.assertIn("--port", cmd)
 
     def test_ensure_server_returns_url_when_healthy(self):
@@ -554,15 +554,11 @@ from pathlib import Path
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8144
 
-MODEL_PATH = (
-    "/home/k/.cache/huggingface/hub/models--mradermacher--translategemma-4b-it-i1-GGUF/"
-    "snapshots/ffb12df0e4a6d7a4c500376b1d6a66d73409e085/"
-    "translategemma-4b-it.i1-IQ4_NL.gguf"
-)
+MODEL_PATH = "mradermacher/translategemma-4b-it-i1-GGUF:IQ4_NL"
 
 TEMPLATE_PATH = Path(__file__).resolve().parent / "translategemma.jinja"
 
-STATE_DIR = (Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")) / "trans").expanduser()
+STATE_DIR = (Path(os.environ.get("XDG_STATE_HOME", "/home/k/.local/state")) / "trans").expanduser()
 
 
 def health_url(host: str, port: int) -> str:
@@ -576,7 +572,7 @@ def chat_url(host: str, port: int) -> str:
 def server_command(host: str, port: int) -> list[str]:
     return [
         "llama-server",
-        "-m", MODEL_PATH,
+        "-hf", MODEL_PATH,
         "--host", host,
         "--port", str(port),
         "--no-webui",
@@ -703,7 +699,7 @@ git commit -m "feat: add llama-server lifecycle management"
 - Consumes: direction codes `"en"`/`"ru"` (Task 1 vocabulary).
 - Produces:
   - `PIPER = "/home/k/.local/sbin/piper"`
-  - `VOICES = {"ru": "/home/k/.cache/piper/ru_RU-irina-medium.onnx", "en": "/home/k/.cache/piper/en_US-libritts_r-medium.onnx"}`
+  - `VOICES = {"ru": os.path.join(os.environ.get("HOME", "/home/user"), ".cache/piper/ru_RU-irina-medium.onnx"), "en": os.path.join(os.environ.get("HOME", "/home/user"), ".cache/piper/en_US-libritts_r-medium.onnx")}`
   - `PLAYER_CANDIDATES = ["pw-play", "paplay", "aplay"]`
   - `find_player() -> str | None` — first candidate on PATH via `shutil.which`, else None.
   - `speak(text: str, direction_out: str) -> bool` — synthesizes with the voice matching the output language (for direction `"en"` the output is Russian → use `VOICES["ru"]`; for `"ru"` → `VOICES["en"]`), pipes WAV through the player, returns True if the pipeline succeeded. Implementation: `p1 = Popen([PIPER, "--cuda", "--model", voice, "-f", "-"], stdin=PIPE, stdout=PIPE); p2 = Popen([player, "-"], stdin=p1.stdout)` — feed text to piper's stdin, close handles, wait for both; False if either exits non-zero or player is None. Never raises (prints a warning to stderr on failure).
@@ -741,10 +737,10 @@ class TestSpeaker(unittest.TestCase):
                 p.poll.return_value = 0
             self.assertTrue(speak("Привет!", "en"))
         piper_argv = popen.call_args_list[0][0][0]
-        self.assertEqual(piper_argv[0], "/home/k/.local/sbin/piper")
+        self.assertEqual(piper_argv[0], os.path.join(os.environ.get("HOME", "/home/user"), ".local/sbin/piper"))
         self.assertIn("--cuda", piper_argv)
         self.assertEqual(piper_argv[piper_argv.index("--model") + 1],
-                         "/home/k/.cache/piper/ru_RU-irina-medium.onnx")
+                         os.path.join(os.environ.get("HOME", "/home/user"), ".cache/piper/ru_RU-irina-medium.onnx"))
         self.assertEqual(piper_argv[piper_argv.index("-f") + 1], "-")
 
     def test_speak_english_voice_for_russian_direction(self):
@@ -759,7 +755,7 @@ class TestSpeaker(unittest.TestCase):
             self.assertTrue(speak("Hello!", "ru"))
         piper_argv = popen.call_args_list[0][0][0]
         self.assertEqual(piper_argv[piper_argv.index("--model") + 1],
-                         "/home/k/.cache/piper/en_US-libritts_r-medium.onnx")
+                         os.path.join(os.environ.get("HOME", "/home/user"), ".cache/piper/en_US-libritts_r-medium.onnx"))
 
     def test_speak_returns_false_without_player(self):
         with mock.patch("trans.find_player", return_value=None):
@@ -1143,7 +1139,7 @@ git commit -m "feat: add CLI and interactive REPL"
 
 **Files:**
 - Create: `README.md`
-- Create symlink: `~/.local/bin/trans` -> `/home/k/.local/src/python/trans/trans.py` (not committed; do not gitignore-hack it, it lives outside the repo)
+- Create symlink: `/home/k/.local/bin/trans` -> `/home/k/.local/src/python/trans/trans.py` (not committed; do not gitignore-hack it, it lives outside the repo)
 
 **Interfaces:**
 - Consumes: full app.
@@ -1153,16 +1149,16 @@ git commit -m "feat: add CLI and interactive REPL"
 
 ```bash
 chmod +x trans.py
-mkdir -p ~/.local/bin
-ln -sf /home/k/.local/src/python/trans/trans.py ~/.local/bin/trans
+mkdir -p /home/k/.local/bin
+ln -sf /home/k/.local/src/python/trans/trans.py /home/k/.local/bin/trans
 hash -r; which trans
 ```
 
-Expected: `/home/k/.local/bin/trans` (ensure `~/.local/bin` precedes any stale `trans` in PATH).
+Expected: `/home/k/.local/bin/trans` (ensure `/home/k/.local/bin` precedes any stale `trans` in PATH).
 
 - [ ] **Step 2: Verify unit suite still passes via installed path**
 
-Run: `python3 ~/.local/bin/trans --version`
+Run: `python3 /home/k/.local/bin/trans --version`
 Expected: `trans 1.0.0`
 Run: `python3 tests/test_trans.py -v`
 Expected: 46 PASS
@@ -1212,14 +1208,14 @@ of what you type (Cyrillic -> English, otherwise -> Russian).
 
 - llama.cpp's `llama-server` (on PATH)
 - TranslateGemma 4B GGUF (already at the hardcoded model path)
-- piper TTS at `~/.local/sbin/piper` with the `ru_RU-irina-medium` and
+- piper TTS at `/home/k/.local/sbin/piper` with the `ru_RU-irina-medium` and
   `en_US-libritts_r-medium` voices
 - a WAV player: `pw-play`, `paplay`, or `aplay`
 
 ## Install
 
 ```sh
-ln -sf "$PWD/trans.py" ~/.local/bin/trans
+ln -sf "$PWD/trans.py" /home/k/.local/bin/trans
 ```
 
 ## Usage
@@ -1232,7 +1228,7 @@ ln -sf "$PWD/trans.py" ~/.local/bin/trans
 The app talks to `llama-server` at `127.0.0.1:8144` (override with
 `--host`/`--port`). By default it auto-starts a detached server if none is
 running and leaves it running afterwards. Server logs live in
-`~/.local/state/trans/server.log`.
+`/home/k/.local/state/trans/server.log`.
 
 Set `TRANS_AUTO_START=0` to manage the server yourself: the app then prints
 the exact command it wants you to run and exits if the server is missing.

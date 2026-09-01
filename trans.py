@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """trans - translator that prints and speaks the result.
 
-Input language is detected with the running translation model (or forced
-with --from). Output defaults to English; English input defaults to
-Spanish instead; --to overrides. Speech uses piper TTS, which plays the
-audio itself.
+Translation runs on llama-server. A router-mode server that is already
+running and hosts a TranslateGemma model (discovered via /v1/models) is
+preferred; requests then select that model by id. Otherwise trans uses
+a dedicated single-model server it can start itself. Input language is
+detected with the running translation model (or forced with --from).
+Output defaults to English; English input defaults to Spanish instead;
+--to overrides. Speech uses piper TTS, which plays the audio itself.
 """
 
 from __future__ import annotations
@@ -33,28 +36,34 @@ from pathlib import Path
 DEFAULT_TARGET = "en"
 SECONDARY_TARGET = "es"
 
-# llama-server defaults and model files
+# Dedicated single-model server (the fallback) and its model files.
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8144
 
-MODEL_PATH = (
-    "/home/k/.cache/huggingface/hub/"
-    "models--mradermacher--translategemma-4b-it-i1-GGUF/"
-    "snapshots/ffb12df0e4a6d7a4c500376b1d6a66d73409e085/"
-    "translategemma-4b-it.i1-IQ4_NL.gguf"
-)
+# Preferred backend: a router-mode llama-server already running and
+# hosting a TranslateGemma model (advertised on /v1/models, selected by
+# id on every request).
+ROUTER_HOST = "127.0.0.1"
+ROUTER_PORT = 8087
+
+MODEL_PATH = "mradermacher/translategemma-4b-it-i1-GGUF:IQ4_NL"
 
 TEMPLATE_PATH = Path(__file__).resolve().parent / "translategemma.jinja"
 
+HOME = os.environ.get("HOME", os.environ.get("USERPROFILE", "C:\\Users\\user"))
+
+XDG_STATE_FALLBACK = os.path.join(HOME, ".local", "state")
 STATE_DIR = (
-    Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")) / "trans"
+    Path(os.environ.get("XDG_STATE_HOME", XDG_STATE_FALLBACK)) / "trans"
 ).expanduser()
 
 # Speech: piper TTS. The binary plays the synthesized audio itself, so no
 # output file or separate player is needed.
-PIPER = "/home/k/.local/sbin/piper"
-PIPER_DIR = Path("/home/k/.cache/piper")
-DOWNLOAD_VOICES = "/home/k/.local/sbin/download_voices"
+PIPER = "piper"
+PIPER_DIR = Path(HOME) / ".cache/piper"
+#PIPER_DIR = Path(os.environ.get("HOME", "/home/user")) / ".cache/piper"
+
+DOWNLOAD_VOICES = "download_voices"
 PREFERRED_VOICES: dict[str, str] = {
     "en": "en_US-libritts_r-medium",
     "ru": "ru_RU-irina-medium",
@@ -102,7 +111,7 @@ LANGUAGES: dict[str, str] = {
 
 _ANSWER_RE = re.compile(r"^[^A-Za-z]*([A-Za-z]{2,3})[^A-Za-z]*$")
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # ---------------------------------------------------------------------------
 
@@ -183,14 +192,18 @@ def _chat(
     timeout: float = 180.0,
     debug: bool = False,
     stderr=None,
+    model: str | None = None,
 ) -> str:
-    """One chat completion; returns the stripped assistant content."""
-    # Support both formats: standard chatml and translation Gemma format
-    # First try standard chatml (just a string)
-    payload = json.dumps(
-        {"messages": [{"role": "user", "content": prompt}]}
-    ).encode()
-    
+    """One chat completion; returns the stripped assistant content.
+
+    model names the model to use on a router-mode server; None (the
+    dedicated single-model server case) omits the field entirely.
+    """
+    request_body: dict = {"messages": [{"role": "user", "content": prompt}]}
+    if model is not None:
+        request_body["model"] = model
+    payload = json.dumps(request_body).encode()
+
     endpoint = f"{server_url.rstrip('/')}/v1/chat/completions"
     _debug_command(
         f"POST {endpoint}", debug, stderr, input_text=prompt
@@ -213,11 +226,12 @@ def _chat_with_retry(
     max_attempts: int = 2,
     debug: bool = False,
     stderr=None,
+    model: str | None = None,
 ) -> str:
     last_error: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            return _chat(server_url, prompt, timeout, debug, stderr)
+            return _chat(server_url, prompt, timeout, debug, stderr, model)
         except urllib.error.HTTPError as err:
             detail = ""
             try:
@@ -247,12 +261,14 @@ def detect_language(
     text: str,
     debug: bool = False,
     stderr=None,
+    model: str | None = None,
 ) -> str:
     """Ask the running model for the input text's ISO 639-1 code."""
     if not text.strip():
         raise TranslateError("nothing to detect in empty input")
     answer = _chat_with_retry(
-        server_url, DETECT_PROMPT + text.strip(), debug=debug, stderr=stderr
+        server_url, DETECT_PROMPT + text.strip(),
+        debug=debug, stderr=stderr, model=model,
     )
     match = _ANSWER_RE.match(answer)
     if not match:
@@ -272,6 +288,7 @@ def translate(
     max_attempts: int = 2,
     debug: bool = False,
     stderr=None,
+    model: str | None = None,
 ) -> str:
     """Send the translation prompt to llama-server, return bare translation."""
     content = _chat_with_retry(
@@ -281,10 +298,42 @@ def translate(
         max_attempts,
         debug,
         stderr,
+        model,
     )
     if not content:
         raise TranslateError("the model returned an empty translation")
     return content
+
+
+def find_router_model(
+    server_url: str,
+    timeout: float = 5.0,
+    debug: bool = False,
+    stderr=None,
+) -> str | None:
+    """Return the id of the TranslateGemma model a server advertises.
+
+    Probes /v1/models, where a router-mode llama-server lists every
+    model it can host. Matches the id containing "translategemma", else
+    an alias of exactly "trans"; None means this server is unusable for
+    translation (unreachable, or no TranslateGemma among its models).
+    """
+    endpoint = f"{server_url.rstrip('/')}/v1/models"
+    _debug_command(f"GET {endpoint}", debug, stderr)
+    try:
+        with urllib.request.urlopen(endpoint, timeout=timeout) as response:
+            body = json.loads(response.read().decode())
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    entries = body.get("data") or []
+    for entry in entries:
+        if "translategemma" in str(entry.get("id", "")).lower():
+            return entry["id"]
+    for entry in entries:
+        aliases = [str(alias).lower() for alias in entry.get("aliases") or []]
+        if "trans" in aliases or "translategemma" in aliases:
+            return entry["id"]
+    return None
 
 
 # --- server manager --------------------------------------------------------
@@ -300,7 +349,7 @@ def chat_url(host: str, port: int) -> str:
 def server_command(host: str, port: int) -> list[str]:
     return [
         "llama-server",
-        "-m", MODEL_PATH,
+        "-hf", MODEL_PATH,
         "--host", host,
         "--port", str(port),
         "--no-webui",
@@ -582,11 +631,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--host", default=DEFAULT_HOST,
-        help=f"server host (default {DEFAULT_HOST})",
+        help=f"fallback dedicated server host (default {DEFAULT_HOST})",
     )
     parser.add_argument(
         "--port", type=int, default=DEFAULT_PORT,
-        help=f"server port (default {DEFAULT_PORT})",
+        help=f"fallback dedicated server port (default {DEFAULT_PORT})",
+    )
+    parser.add_argument(
+        "--router-host", default=ROUTER_HOST,
+        help=f"router-mode server host (default {ROUTER_HOST})",
+    )
+    parser.add_argument(
+        "--router-port", type=int, default=ROUTER_PORT,
+        help=f"router-mode server port (default {ROUTER_PORT})",
     )
     parser.add_argument(
         "--debug", action="store_true",
@@ -610,19 +667,34 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return args
 
 
-def resolve_server_url(
-    args: argparse.Namespace, env: dict[str, str]
-) -> tuple[str, tuple[str, int] | None, bool]:
-    """Return (external_url, host_port, auto_start).
+def resolve_backend(
+    args: argparse.Namespace,
+    env: dict[str, str],
+    debug: bool = False,
+    stderr=None,
+) -> tuple[str, str | None]:
+    """Return (server_url, model_id) to send translate requests to.
 
-    external_url is non-None only when TRANS_SERVER_URL points at a server
-    whose lifecycle we must never manage; host_port is None in that case.
+    Prefers a router-mode llama-server already running at
+    args.router_host:args.router_port that advertises a TranslateGemma
+    model; every request then selects that model by id. Otherwise falls
+    back to the dedicated single-model server, auto-starting it when
+    TRANS_AUTO_START allows. TRANS_SERVER_URL pins one fixed server
+    whose lifecycle trans never manages; model selection still applies
+    when that server hosts TranslateGemma.
     """
+    out = stderr if stderr is not None else sys.stderr
     external = env.get("TRANS_SERVER_URL", "").strip()
     if external:
-        return external.rstrip("/"), None, False
+        base = external.rstrip("/")
+        return base, find_router_model(base, debug=debug, stderr=out)
+    router_url = chat_url(args.router_host, args.router_port)
+    model = find_router_model(router_url, debug=debug, stderr=out)
+    if model is not None:
+        return router_url, model
     auto_start = env.get("TRANS_AUTO_START", "1").strip() != "0"
-    return None, (args.host, args.port), auto_start
+    url = ensure_server(args.host, args.port, auto_start, debug=debug)
+    return url, None
 
 
 def translate_once(
@@ -634,6 +706,7 @@ def translate_once(
     stdout=None,
     debug: bool = False,
     stderr=None,
+    model: str | None = None,
 ) -> None:
     """Detect (unless told), translate, print, and speak one phrase."""
     if not text.strip():
@@ -642,8 +715,11 @@ def translate_once(
     if direction_source is None:
         try:
             direction_source = detect_language(
-                server_url, text, debug=debug, stderr=stderr
+                server_url, text, debug=debug, stderr=stderr, model=model
             )
+            lang_name = LANGUAGES.get(direction_source, direction_source)
+            err = stderr if stderr is not None else sys.stderr
+            print(f"{direction_source} ({lang_name})", file=err)
         except TranslateError as err:
             if to_lang is not None:
                 direction_source = None  # cannot detect; --to still known
@@ -656,7 +732,8 @@ def translate_once(
         direction_source = "ru" if to_lang == "en" else "en"
     target = pick_target(direction_source, to_lang)
     translation = translate(
-        server_url, text, direction_source, target, debug=debug, stderr=stderr
+        server_url, text, direction_source, target,
+        debug=debug, stderr=stderr, model=model,
     )
     out = stdout if stdout is not None else sys.stdout
     print(f"{target}: {translation}", file=out)
@@ -671,6 +748,7 @@ def run_repl(
     speak_flag: bool,
     stdout=None,
     debug: bool = False,
+    model: str | None = None,
 ) -> None:
     out = stdout if stdout is not None else sys.stdout
     print("type a phrase in any language; q to quit", file=out)
@@ -687,7 +765,7 @@ def run_repl(
         try:
             translate_once(
                 line, server_url, from_lang, to_lang, speak_flag,
-                stdout=out, debug=debug,
+                stdout=out, debug=debug, model=model,
             )
         except TranslateError as err:
             print(f"error: {err}", file=sys.stderr)
@@ -709,19 +787,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         print("no recorded server to stop", file=sys.stderr)
         return 1
-    external_url, host_port, auto_start = resolve_server_url(
-        args, dict(os.environ)
-    )
     try:
-        if external_url is not None:
-            server_url = external_url
-        elif host_port is not None:
-            host, port = host_port
-            server_url = ensure_server(
-                host, port, auto_start, debug=args.debug
-            )
-        else:  # pragma: no cover - resolve_server_url always fills one
-            raise TranslateError("no server configured")
+        server_url, model_id = resolve_backend(
+            args, dict(os.environ), debug=args.debug
+        )
     except TranslateError:
         return 1
     try:
@@ -733,10 +802,11 @@ def main(argv: list[str] | None = None) -> int:
                 args.to_lang,
                 args.speak_flag,
                 debug=args.debug,
+                model=model_id,
             )
         else:
             run_repl(server_url, args.from_lang, args.to_lang,
-                     args.speak_flag, debug=args.debug)
+                     args.speak_flag, debug=args.debug, model=model_id)
     except TranslateError as err:
         print(f"error: {err}", file=sys.stderr)
         return 1

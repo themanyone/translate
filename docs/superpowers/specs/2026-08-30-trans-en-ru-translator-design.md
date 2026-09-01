@@ -12,8 +12,8 @@ A command-line app: give it a phrase in unknown tongue, it translates to [Langua
 
 - **TranslateGemma 4B** GGUF (mradermacher i1-IQ4_NL quant) served by `llama-server` from `llama.cpp` 0.3.0-dev.
 - **Chat template** `translategemma.jinja` (in repo). It expects structured user content (`source_lang_code`/`target_lang_code`); when served plainly with `--no-jinja --chat-template-file`, a plain-string user message passes through and the model follows instruction text embedded in the prompt.
-- **Piper TTS** at `~/.local/sbin/piper` with `--cuda` flag.
-- **download_voices** at `~/.local/sbin/download_voices` for listing and fetching piper voices.
+- **Piper TTS** at `/home/k/.local/sbin/piper` with `--cuda` flag.
+- **download_voices** at `/home/k/.local/sbin/download_voices` for listing and fetching piper voices.
 - Put a list of configurable dirs at top of code.
 
 ## Key findings from experiments (2026-08-30)
@@ -26,13 +26,13 @@ A command-line app: give it a phrase in unknown tongue, it translates to [Langua
 
 ## Architecture
 
-Single-file stdlib Python app (no pip dependencies): `translate.py` installed to `~/.local/sbin/translate.py`, source lives in this repo.
+Single-file stdlib Python app (no pip dependencies): `translate.py` installed to `/home/k/.local/sbin/translate.py`, source lives in this repo.
 
 ### Components
 
 1. **Server manager**
    - Checks `GET {url}/health`; expects `{"status":"ok"}`.
-   - If unreachable and auto-start enabled: launches `llama-server` detached (nohup-style, own process group), state under `~/.local/state/trans/` (`server.log`, `server.pid`), polls health up to ~120 s.
+   - If unreachable and auto-start enabled: launches `llama-server` detached (nohup-style, own process group), state under `/home/k/.local/state/trans/` (`server.log`, `server.pid`), polls health up to ~120 s.
    - If unreachable and auto-start disabled: prints the exact launch command and exits non-zero.
    - Never stops the server on app exit; `trans --stop-server` is the explicit off-switch (reads `server.pid`, SIGTERM, waits).
    - Address configurable: `--port` (default 8144), `--host` (default 127.0.0.1), env `TRANS_SERVER_URL` (full URL override), `TRANS_AUTO_START` (default `1`; `0` disables).
@@ -63,7 +63,7 @@ Single-file stdlib Python app (no pip dependencies): `translate.py` installed to
 
 ### Error handling
 
-- Server not reachable after auto-start attempt (timeout) → clear message pointing at `~/.local/state/trans/server.log`.
+- Server not reachable after auto-start attempt (timeout) → clear message pointing at `/home/k/.local/state/trans/server.log`.
 - HTTP error / malformed JSON / empty content → report and continue (REPL) or exit non-zero (one-shot).
 - Unrecognized `--from`/`--to` language, or undetectable input language → report and continue (REPL) or exit non-zero (one-shot).
 - Piper/play/voice-download failure → warn, continue.

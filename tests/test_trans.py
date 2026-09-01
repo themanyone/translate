@@ -17,10 +17,12 @@ from trans import (  # noqa: E402
     build_prompt,
     detect_language,
     ensure_server,
+    find_router_model,
     health_url,
     main,
     parse_args,
     pick_target,
+    resolve_backend,
     resolve_language,
     run_repl,
     server_command,
@@ -174,6 +176,21 @@ class TestTranslate(unittest.TestCase):
             ],
         )
         self.assertNotIn("temperature", body)
+        self.assertNotIn("model", body)  # dedicated server: no selector
+
+    def test_model_selector_sent_when_given(self):
+        # router-mode server: every request names the model to use
+        with mock.patch("trans.urllib.request.urlopen") as up:
+            up.return_value = self._ok_response("Hola.")
+            translate(
+                self.SERVER, "Hello.", "en", "es",
+                model="mradermacher/translategemma-4b-it-i1-GGUF:IQ4_NL",
+            )
+        body = self._assert_request_body(up)
+        self.assertEqual(
+            body["model"],
+            "mradermacher/translategemma-4b-it-i1-GGUF:IQ4_NL",
+        )
 
     def test_strips_whitespace_from_content(self):
         with mock.patch("trans.urllib.request.urlopen") as up:
@@ -229,6 +246,127 @@ class TestTranslate(unittest.TestCase):
             up.return_value = resp
             with self.assertRaises(TranslateError):
                 translate(self.SERVER, "OK.", "en", "ru")
+
+
+class TestFindRouterModel(unittest.TestCase):
+    SERVER = "http://127.0.0.1:8087"
+
+    def _models_ok(self, data: list) -> mock.MagicMock:
+        resp = mock.MagicMock()
+        resp.read.return_value = json.dumps({"data": data}).encode()
+        resp.__enter__.return_value = resp
+        return resp
+
+    def test_matches_translategemma_id(self):
+        with mock.patch("trans.urllib.request.urlopen") as up:
+            up.return_value = self._models_ok([
+                {"id": "gemma-4-12b-it-Q4_0", "aliases": []},
+                {"id": "mradermacher/translategemma-4b-it-i1-GGUF:IQ4_NL",
+                 "aliases": ["trans"]},
+            ])
+            self.assertEqual(
+                find_router_model(self.SERVER),
+                "mradermacher/translategemma-4b-it-i1-GGUF:IQ4_NL",
+            )
+
+    def test_matches_trans_alias_when_id_differs(self):
+        with mock.patch("trans.urllib.request.urlopen") as up:
+            up.return_value = self._models_ok([
+                {"id": "some-renamed-model", "aliases": ["trans"]},
+            ])
+            self.assertEqual(find_router_model(self.SERVER),
+                             "some-renamed-model")
+
+    def test_none_when_server_unreachable(self):
+        with mock.patch("trans.urllib.request.urlopen") as up:
+            up.side_effect = URLError("refused")
+            self.assertIsNone(find_router_model(self.SERVER))
+
+    def test_none_when_no_translategemma_hosted(self):
+        with mock.patch("trans.urllib.request.urlopen") as up:
+            up.return_value = self._models_ok([
+                {"id": "gemma-4-12b-it-Q4_0", "aliases": ["g12"]},
+            ])
+            self.assertIsNone(find_router_model(self.SERVER))
+
+    def test_none_on_malformed_body(self):
+        with mock.patch("trans.urllib.request.urlopen") as up:
+            resp = mock.MagicMock()
+            resp.read.return_value = b"not json"
+            resp.__enter__.return_value = resp
+            up.return_value = resp
+            self.assertIsNone(find_router_model(self.SERVER))
+
+
+class TestResolveBackend(unittest.TestCase):
+    def _args(self, **overrides):
+        args = parse_args(["hi"])
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_prefers_running_router_with_translategemma(self):
+        model_id = "mradermacher/translategemma-4b-it-i1-GGUF:IQ4_NL"
+        with mock.patch(
+                "trans.find_router_model", return_value=model_id,
+        ) as find, mock.patch("trans.ensure_server") as ensure:
+            url, model = resolve_backend(self._args(), {})
+        self.assertEqual(url, "http://127.0.0.1:8087")
+        self.assertEqual(
+            model, "mradermacher/translategemma-4b-it-i1-GGUF:IQ4_NL"
+        )
+        find.assert_called_once_with(
+            "http://127.0.0.1:8087", debug=False, stderr=mock.ANY
+        )
+        ensure.assert_not_called()
+
+    def test_falls_back_to_dedicated_server_without_router_model(self):
+        with mock.patch("trans.find_router_model", return_value=None), \
+                mock.patch(
+                    "trans.ensure_server", return_value="http://127.0.0.1:8144"
+                ) as ensure:
+            url, model = resolve_backend(self._args(), {})
+        self.assertEqual(url, "http://127.0.0.1:8144")
+        self.assertIsNone(model)
+        ensure.assert_called_once_with(
+            "127.0.0.1", 8144, True, debug=False
+        )
+
+    def test_fallback_respects_auto_start_env(self):
+        with mock.patch("trans.find_router_model", return_value=None), \
+                mock.patch(
+                    "trans.ensure_server", return_value="http://127.0.0.1:8144"
+                ) as ensure:
+            resolve_backend(self._args(), {"TRANS_AUTO_START": "0"})
+        ensure.assert_called_once_with(
+            "127.0.0.1", 8144, False, debug=False
+        )
+
+    def test_fallback_uses_host_port_overrides(self):
+        with mock.patch("trans.find_router_model", return_value=None), \
+                mock.patch(
+                    "trans.ensure_server", return_value="http://127.0.0.1:9000"
+                ) as ensure:
+            resolve_backend(
+                self._args(host="127.0.0.1", port=9000), {}
+            )
+        ensure.assert_called_once_with(
+            "127.0.0.1", 9000, True, debug=False
+        )
+
+    def test_env_url_pins_server_and_probes_it_for_a_model(self):
+        with mock.patch(
+                "trans.find_router_model", return_value="trans-model"
+        ) as find, mock.patch("trans.ensure_server") as ensure:
+            url, model = resolve_backend(
+                self._args(), {"TRANS_SERVER_URL": "http://elsewhere:9999"}
+            )
+        self.assertEqual(url, "http://elsewhere:9999")
+        self.assertEqual(model, "trans-model")
+        find.assert_called_once_with(
+            "http://elsewhere:9999", debug=False, stderr=mock.ANY
+        )
+        ensure.assert_not_called()
 
 
 class TestVoiceForLanguage(unittest.TestCase):
@@ -299,7 +437,7 @@ class TestSpeak(unittest.TestCase):
             self.assertTrue(speak("Привет!", "ru"))
         vf.assert_called_once_with("ru", debug=False, stderr=None)
         argv = popen.call_args[0][0]
-        self.assertEqual(argv[0], "/home/k/.local/sbin/piper")
+        self.assertEqual(argv[0], "piper")
         self.assertIn("--cuda", argv)
         self.assertEqual(
             argv[argv.index("--model") + 1], "/fake/ru_RU-x.onnx"
@@ -384,7 +522,7 @@ class TestServerManager(unittest.TestCase):
             cmd[cmd.index("--chat-template-file") + 1],
             str(trans.TEMPLATE_PATH),
         )
-        self.assertEqual(cmd[cmd.index("-m") + 1], trans.MODEL_PATH)
+        self.assertEqual(cmd[cmd.index("-hf") + 1], trans.MODEL_PATH)
         self.assertIn("--port", cmd)
 
     def test_ensure_server_returns_url_when_healthy(self):
@@ -561,22 +699,13 @@ class TestCLI(unittest.TestCase):
                 mock.patch("sys.stderr"):
             parse_args(["--bogus", "hi"])
 
-    def test_resolve_url_env_override_disables_autostart(self):
-        external, host_port, auto = trans.resolve_server_url(
-            parse_args(["--port", "1234", "hi"]),
-            {"TRANS_SERVER_URL": "http://elsewhere:9999"},
-        )
-        self.assertEqual(external, "http://elsewhere:9999")
-        self.assertIsNone(host_port)
-        self.assertFalse(auto)
-
-    def test_resolve_url_defaults(self):
-        external, host_port, auto = trans.resolve_server_url(
-            parse_args(["hi"]), {}
-        )
-        self.assertIsNone(external)
-        self.assertEqual(host_port, ("127.0.0.1", 8144))
-        self.assertTrue(auto)
+    def test_parse_args_router_flags(self):
+        args = parse_args(["--router-port", "9001", "hi"])
+        self.assertEqual(args.router_host, "127.0.0.1")
+        self.assertEqual(args.router_port, 9001)
+        args = parse_args(["--router-host", "localhost", "hi"])
+        self.assertEqual(args.router_host, "localhost")
+        self.assertEqual(args.router_port, 8087)
 
     def test_translate_once_prints_output_language_prefix(self):
         out = io.StringIO()
@@ -599,7 +728,7 @@ class TestCLI(unittest.TestCase):
             )
         tr.assert_called_once_with(
             "http://x", "Hello!", "en", "es",
-            debug=False, stderr=None,
+            debug=False, stderr=None, model=None,
         )
 
     def test_translate_once_foreign_defaults_to_english(self):
@@ -612,7 +741,7 @@ class TestCLI(unittest.TestCase):
             )
         tr.assert_called_once_with(
             "http://x", "Bonjour", "fr", "en",
-            debug=False, stderr=None,
+            debug=False, stderr=None, model=None,
         )
 
     def test_translate_once_explicit_from_skips_detection(self):
@@ -626,7 +755,7 @@ class TestCLI(unittest.TestCase):
         det.assert_not_called()
         tr.assert_called_once_with(
             "http://x", "Bonjour", "fr", "de",
-            debug=False, stderr=None,
+            debug=False, stderr=None, model=None,
         )
 
     def test_translate_once_blank_input_noop(self):
@@ -671,7 +800,8 @@ class TestCLI(unittest.TestCase):
         stop.assert_not_called()
 
     def test_main_one_shot(self):
-        with mock.patch("trans.ensure_server", return_value="http://x"), \
+        with mock.patch("trans.find_router_model", return_value=None), \
+                mock.patch("trans.ensure_server", return_value="http://x"), \
                 mock.patch("trans.detect_language", return_value="en"), \
                 mock.patch("trans.translate", return_value="¡Hola!"), \
                 mock.patch("trans.speak", return_value=True), \
@@ -680,7 +810,8 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(code, 0)
 
     def test_main_one_shot_with_from_to(self):
-        with mock.patch("trans.ensure_server", return_value="http://x"), \
+        with mock.patch("trans.find_router_model", return_value=None), \
+                mock.patch("trans.ensure_server", return_value="http://x"), \
                 mock.patch("trans.detect_language") as det, \
                 mock.patch("trans.translate", return_value="Привет"), \
                 mock.patch("trans.speak", return_value=True), \
@@ -690,7 +821,8 @@ class TestCLI(unittest.TestCase):
         det.assert_not_called()
 
     def test_main_one_shot_error_exits_nonzero(self):
-        with mock.patch("trans.ensure_server", return_value="http://x"), \
+        with mock.patch("trans.find_router_model", return_value=None), \
+                mock.patch("trans.ensure_server", return_value="http://x"), \
                 mock.patch("trans.detect_language", return_value="en"), \
                 mock.patch("trans.translate",
                            side_effect=TranslateError("bad")), \
@@ -699,9 +831,10 @@ class TestCLI(unittest.TestCase):
             self.assertEqual(main(["Hello!"]), 1)
 
     def test_main_fatal_error_returns_one(self):
-        with mock.patch(
-                "trans.ensure_server",
-                side_effect=TranslateError("no server")), \
+        with mock.patch("trans.find_router_model", return_value=None), \
+                mock.patch(
+                    "trans.ensure_server",
+                    side_effect=TranslateError("no server")), \
                 mock.patch("sys.stderr"):
             self.assertEqual(main(["Hello!"]), 1)
 
@@ -769,7 +902,7 @@ class TestDebug(unittest.TestCase):
             self.assertTrue(speak("hi", "ru", debug=True, stderr=err))
         argv = popen.call_args[0][0]
         printed = err.getvalue()
-        self.assertIn("/home/k/.local/sbin/piper", printed)
+        self.assertIn("piper", printed)
         self.assertIn("--cuda", printed)
         self.assertIn("/fake/v.onnx", printed)
         self.assertIn("<<< hi", printed)  # stdin text shown as heredoc
