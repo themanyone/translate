@@ -37,8 +37,11 @@ from translate import (
     translate_once,
     voice_for_language,
 )
-# Import the translate function separately for tests that reference it directly
-from translate import translate
+# Import the module so tests can patch module attributes (translate_module.PIPER_DIR etc.)
+import translate as translate_module
+
+# The translate function, imported under a non-shadowing name
+from translate import translate as translate_function
 
 
 class TestResolveLanguage(unittest.TestCase):
@@ -166,7 +169,7 @@ class TestTranslate(unittest.TestCase):
     def test_returns_translation_content(self):
         with mock.patch("translate.urllib.request.urlopen") as up:
             up.return_value = self._ok_response("Привет! Меня зовут Ик.")
-            result = translate(
+            result = translate_function(
                 self.SERVER, "Hello! My name is Eek.", "en", "ru"
             )
         self.assertEqual(result, "Привет! Меня зовут Ик.")
@@ -189,7 +192,7 @@ class TestTranslate(unittest.TestCase):
         # router-mode server: every request names the model to use
         with mock.patch("translate.urllib.request.urlopen") as up:
             up.return_value = self._ok_response("Hola.")
-            translate(
+            translate_function(
                 self.SERVER, "Hello.", "en", "es",
                 model="mradermacher/translategemma-4b-it-i1-GGUF:IQ4_NL",
             )
@@ -202,7 +205,7 @@ class TestTranslate(unittest.TestCase):
     def test_strips_whitespace_from_content(self):
         with mock.patch("translate.urllib.request.urlopen") as up:
             up.return_value = self._ok_response("  Hello.\n")
-            result = translate(self.SERVER, "Привет.", "ru", "en")
+            result = translate_function(self.SERVER, "Привет.", "ru", "en")
         self.assertEqual(result, "Hello.")
 
     def test_retries_once_on_connection_error_then_succeeds(self):
@@ -210,7 +213,7 @@ class TestTranslate(unittest.TestCase):
             up.side_effect = [
                 URLError("conn refused"), self._ok_response("Ок.")
             ]
-            result = translate(self.SERVER, "OK.", "en", "ru")
+            result = translate_function(self.SERVER, "OK.", "en", "ru")
         self.assertEqual(result, "Ок.")
         self.assertEqual(up.call_count, 2)
 
@@ -218,7 +221,7 @@ class TestTranslate(unittest.TestCase):
         with mock.patch("translate.urllib.request.urlopen") as up:
             up.side_effect = URLError("conn refused")
             with self.assertRaises(TranslateError):
-                translate(self.SERVER, "OK.", "en", "ru")
+                translate_function(self.SERVER, "OK.", "en", "ru")
         self.assertEqual(up.call_count, 2)
 
     def test_http_error_raises_without_retry(self):
@@ -227,7 +230,7 @@ class TestTranslate(unittest.TestCase):
                 f"{self.SERVER}/v1/chat/completions", 500, "err", {}, None
             )  # type: ignore[arg-type]
             with self.assertRaises(TranslateError):
-                translate(self.SERVER, "OK.", "en", "ru")
+                translate_function(self.SERVER, "OK.", "en", "ru")
         self.assertEqual(up.call_count, 1)
 
     def test_malformed_json_raises_translate_error(self):
@@ -237,13 +240,13 @@ class TestTranslate(unittest.TestCase):
             resp.__enter__.return_value = resp
             up.return_value = resp
             with self.assertRaises(TranslateError):
-                translate(self.SERVER, "OK.", "en", "ru")
+                translate_function(self.SERVER, "OK.", "en", "ru")
 
     def test_empty_content_raises_translate_error(self):
         with mock.patch("translate.urllib.request.urlopen") as up:
             up.return_value = self._ok_response("   ")
             with self.assertRaises(TranslateError):
-                translate(self.SERVER, "OK.", "en", "ru")
+                translate_function(self.SERVER, "OK.", "en", "ru")
 
     def test_missing_choices_raises_translate_error(self):
         with mock.patch("translate.urllib.request.urlopen") as up:
@@ -252,7 +255,7 @@ class TestTranslate(unittest.TestCase):
             resp.__enter__.return_value = resp
             up.return_value = resp
             with self.assertRaises(TranslateError):
-                translate(self.SERVER, "OK.", "en", "ru")
+                translate_function(self.SERVER, "OK.", "en", "ru")
 
 
 class TestFindRouterModel(unittest.TestCase):
@@ -344,7 +347,7 @@ class TestResolveBackend(unittest.TestCase):
                 mock.patch(
                     "translate.ensure_server", return_value="http://127.0.0.1:8144"
                 ) as ensure:
-            resolve_backend(self._args(), {"translate_AUTO_START": "0"})
+            resolve_backend(self._args(), {"TRANS_AUTO_START": "0"})
         ensure.assert_called_once_with(
             "127.0.0.1", 8144, False, debug=False
         )
@@ -366,7 +369,7 @@ class TestResolveBackend(unittest.TestCase):
                 "translate.find_router_model", return_value="translate-model"
         ) as find, mock.patch("translate.ensure_server") as ensure:
             url, model = resolve_backend(
-                self._args(), {"translate_SERVER_URL": "http://elsewhere:9999"}
+                self._args(), {"TRANS_SERVER_URL": "http://elsewhere:9999"}
             )
         self.assertEqual(url, "http://elsewhere:9999")
         self.assertEqual(model, "translate-model")
@@ -382,7 +385,7 @@ class TestVoiceForLanguage(unittest.TestCase):
             piper_dir = Path(tmp)
             preferred = piper_dir / "en_US-libritts_r-medium.onnx"
             preferred.write_bytes(b"x")
-            with mock.patch.object(translate, "PIPER_DIR", piper_dir):
+            with mock.patch.object(translate_module, "PIPER_DIR", piper_dir):
                 self.assertEqual(voice_for_language("en"), str(preferred))
 
     def test_local_glob_fallback(self):
@@ -390,7 +393,7 @@ class TestVoiceForLanguage(unittest.TestCase):
             piper_dir = Path(tmp)
             other = piper_dir / "de_DE-karlsson-low.onnx"
             other.write_bytes(b"x")
-            with mock.patch.object(translate, "PIPER_DIR", piper_dir):
+            with mock.patch.object(translate_module, "PIPER_DIR", piper_dir):
                 self.assertEqual(voice_for_language("de"), str(other))
 
     def test_downloads_first_matching_voice(self):
@@ -403,7 +406,7 @@ class TestVoiceForLanguage(unittest.TestCase):
             downloaded.write_bytes(b"x")
 
             def fake_run(cmd, **kwargs):
-                if cmd == [translate.DOWNLOAD_VOICES]:
+                if cmd == [translate_module.DOWNLOAD_VOICES]:
                     result = mock.MagicMock()
                     result.returncode = 0
                     result.stdout = listing
@@ -414,7 +417,7 @@ class TestVoiceForLanguage(unittest.TestCase):
                     return result
                 raise AssertionError(f"unexpected cmd: {cmd}")
 
-            with mock.patch.object(translate, "PIPER_DIR", piper_dir), \
+            with mock.patch.object(translate_module, "PIPER_DIR", piper_dir), \
                     mock.patch(
                         "translate.subprocess.run", side_effect=fake_run
                     ):
@@ -427,7 +430,7 @@ class TestVoiceForLanguage(unittest.TestCase):
             result = mock.MagicMock()
             result.returncode = 0
             result.stdout = "en_US-amy-medium\n"
-            with mock.patch.object(translate, "PIPER_DIR", Path(tmp)), \
+            with mock.patch.object(translate_module, "PIPER_DIR", Path(tmp)), \
                     mock.patch(
                         "translate.subprocess.run", return_value=result
                     ):
@@ -527,9 +530,9 @@ class TestServerManager(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--temp") + 1], "0")
         self.assertEqual(
             cmd[cmd.index("--chat-template-file") + 1],
-            str(translate.TEMPLATE_PATH),
+            str(translate_module.TEMPLATE_PATH),
         )
-        self.assertEqual(cmd[cmd.index("-hf") + 1], translate.MODEL_PATH)
+        self.assertEqual(cmd[cmd.index("-hf") + 1], translate_module.MODEL_PATH)
         self.assertIn("--port", cmd)
 
     def test_ensure_server_returns_url_when_healthy(self):
@@ -588,7 +591,7 @@ class TestServerManager(unittest.TestCase):
         # second llama-server; it waits for the existing one to be healthy
         with tempfile.TemporaryDirectory() as state:
             with mock.patch("translate.STATE_DIR", Path(state)):
-                lock_fd = translate._acquire_start_lock(Path(state))
+                lock_fd = translate_module._acquire_start_lock(Path(state))
                 self.assertIsNotNone(lock_fd)
                 try:
                     with mock.patch(
@@ -613,13 +616,13 @@ class TestServerManager(unittest.TestCase):
         # instance
         with tempfile.TemporaryDirectory() as state:
             state_dir = Path(state)
-            holder = translate._acquire_start_lock(state_dir)
+            holder = translate_module._acquire_start_lock(state_dir)
             self.assertIsNotNone(holder)
             try:
                 before = len(os.listdir("/proc/self/fd"))
                 for _ in range(3):
                     self.assertIsNone(
-                        translate._acquire_start_lock(state_dir)
+                        translate_module._acquire_start_lock(state_dir)
                     )
                 after = len(os.listdir("/proc/self/fd"))
                 self.assertEqual(before, after)
@@ -846,7 +849,7 @@ class TestCLI(unittest.TestCase):
             self.assertEqual(main(["Hello!"]), 1)
 
     def test_main_uses_external_url_and_skips_ensure_server(self):
-        # mocks only the network seam: proves the translate_SERVER_URL plumbing
+        # mocks only the network seam: proves the TRANS_SERVER_URL plumbing
         # actually reaches the HTTP layer (regression test for the
         # URL-discard bug).
         ok_body = json.dumps(
@@ -856,7 +859,7 @@ class TestCLI(unittest.TestCase):
         ).encode()
         with mock.patch.dict(
                 os.environ,
-                {"translate_SERVER_URL": "http://elsewhere:9999"}), \
+                {"TRANS_SERVER_URL": "http://elsewhere:9999"}), \
                 mock.patch("translate.ensure_server") as ensure, \
                 mock.patch("translate.urllib.request.urlopen") as up, \
                 mock.patch("sys.stdout"), \
@@ -882,7 +885,7 @@ class TestDebug(unittest.TestCase):
                 mock.patch("translate.STATE_DIR", Path(state)), \
                 mock.patch("translate.subprocess.Popen") as popen:
             popen.return_value.pid = 4242
-            translate._start_server_detached(
+            translate_module._start_server_detached(
                 "127.0.0.1", 8144, Path(state), debug=True, stderr=err
             )
         self.assertIn("llama-server", err.getvalue())
@@ -895,7 +898,7 @@ class TestDebug(unittest.TestCase):
                 mock.patch("translate.STATE_DIR", Path(state)), \
                 mock.patch("translate.subprocess.Popen") as popen:
             popen.return_value.pid = 4242
-            translate._start_server_detached(
+            translate_module._start_server_detached(
                 "127.0.0.1", 8144, Path(state), debug=False, stderr=err
             )
         self.assertEqual(err.getvalue(), "")
@@ -926,7 +929,7 @@ class TestDebug(unittest.TestCase):
 
         def fake_run(cmd, **kwargs):
             # listing first, then the download makes the file appear
-            if cmd == [translate.DOWNLOAD_VOICES]:
+            if cmd == [translate_module.DOWNLOAD_VOICES]:
                 return listing
             (target_dir_box[0] / "es_ES-davefx-medium.onnx").write_bytes(
                 b"x"
@@ -935,7 +938,7 @@ class TestDebug(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             target_dir_box.append(Path(tmp))
-            with mock.patch.object(translate, "PIPER_DIR", Path(tmp)), \
+            with mock.patch.object(translate_module, "PIPER_DIR", Path(tmp)), \
                     mock.patch(
                         "translate.subprocess.run", side_effect=fake_run
                     ):
