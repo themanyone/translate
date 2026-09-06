@@ -630,6 +630,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="print the translation without speaking it",
     )
     parser.add_argument(
+        "--speak-input", dest="speak_input_flag", action="store_true",
+        help="speak the input text in its original language (if detected or specified)",
+    )
+    parser.add_argument(
         "--host", default=DEFAULT_HOST,
         help=f"fallback dedicated server host (default {DEFAULT_HOST})",
     )
@@ -703,6 +707,7 @@ def translate_once(
     from_lang: str | None,
     to_lang: str | None,
     speak_flag: bool,
+    speak_input_flag: bool = False,
     stdout=None,
     debug: bool = False,
     stderr=None,
@@ -739,6 +744,8 @@ def translate_once(
     print(f"{target}: {translation}", file=out)
     if speak_flag:
         speak(translation, target, debug=debug, stderr=stderr)
+    if speak_input_flag:
+        speak(text, direction_source, debug=debug, stderr=stderr)
 
 
 def run_repl(
@@ -746,6 +753,7 @@ def run_repl(
     from_lang: str | None,
     to_lang: str | None,
     speak_flag: bool,
+    speak_input_flag: bool = False,
     stdout=None,
     debug: bool = False,
     model: str | None = None,
@@ -765,7 +773,7 @@ def run_repl(
         try:
             translate_once(
                 line, server_url, from_lang, to_lang, speak_flag,
-                stdout=out, debug=debug, model=model,
+                speak_input_flag, stdout=out, debug=debug, model=model,
             )
         except TranslateError as err:
             print(f"error: {err}", file=sys.stderr)
@@ -801,12 +809,13 @@ def main(argv: list[str] | None = None) -> int:
                 args.from_lang,
                 args.to_lang,
                 args.speak_flag,
+                args.speak_input_flag,
                 debug=args.debug,
                 model=model_id,
             )
         else:
             run_repl(server_url, args.from_lang, args.to_lang,
-                     args.speak_flag, debug=args.debug, model=model_id)
+                     args.speak_flag, args.speak_input_flag, debug=args.debug, model=model_id)
     except TranslateError as err:
         print(f"error: {err}", file=sys.stderr)
         return 1

@@ -728,6 +728,20 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(out.getvalue(), "es: ¡Hola!\n")
         sp.assert_called_once_with("¡Hola!", "es", debug=False, stderr=None)
 
+    def test_translate_once_speaks_input(self):
+        out = io.StringIO()
+        with mock.patch("translate.detect_language", return_value="fr"), \
+                mock.patch("translate.translate", return_value="Hello") as tr, \
+                mock.patch("translate.speak") as sp:
+            translate_once(
+                "Bonjour", "http://x", None, None, True, True, stdout=out
+            )
+        self.assertEqual(out.getvalue(), "en: Hello\n")
+        sp.assert_called()
+        self.assertEqual(sp.call_count, 2)
+        sp.assert_any_call("Hello", "en", debug=False, stderr=None)
+        sp.assert_any_call("Bonjour", "fr", debug=False, stderr=None)
+
     def test_translate_once_english_defaults_to_spanish(self):
         out = io.StringIO()
         with mock.patch("translate.detect_language", return_value="en"), \

@@ -80,6 +80,7 @@ llama-server --jinja --models-dir /my/models --models-preset
 - `translate --to <lang> <phrase...>` - choose the output language; e.g.
   `--to Spanish`.
 - `translate --no-speak <phrase...>` - print only.
+- `translate --speak-input <phrase...>` - speak the input text in its original language before translating.
 - `translate --router-port <port>` - router server port (default 8087);
   `--router-host` likewise (default 127.0.0.1)
 - `translate --stop-server` - stop the auto-started dedicated llama-server.
