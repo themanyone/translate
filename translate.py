@@ -742,10 +742,10 @@ def translate_once(
     )
     out = stdout if stdout is not None else sys.stdout
     print(f"{target}: {translation}", file=out)
-    if speak_flag:
-        speak(translation, target, debug=debug, stderr=stderr)
     if speak_input_flag:
         speak(text, direction_source, debug=debug, stderr=stderr)
+    if speak_flag:
+        speak(translation, target, debug=debug, stderr=stderr)
 
 
 def run_repl(

@@ -739,8 +739,14 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(out.getvalue(), "en: Hello\n")
         sp.assert_called()
         self.assertEqual(sp.call_count, 2)
-        sp.assert_any_call("Hello", "en", debug=False, stderr=None)
-        sp.assert_any_call("Bonjour", "fr", debug=False, stderr=None)
+        # input is spoken before the translation
+        self.assertEqual(
+            sp.call_args_list,
+            [
+                mock.call("Bonjour", "fr", debug=False, stderr=None),
+                mock.call("Hello", "en", debug=False, stderr=None),
+            ],
+        )
 
     def test_translate_once_english_defaults_to_spanish(self):
         out = io.StringIO()
