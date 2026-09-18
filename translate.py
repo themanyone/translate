@@ -725,7 +725,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "or Spanish when the input is English",
     )
     parser.add_argument(
-        "--no-speak", dest="speak_flag", action="store_false",
+        "-ns", "--no-speak", dest="speak_flag", action="store_false",
         help="print the translation without speaking it",
     )
     parser.add_argument(
