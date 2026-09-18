@@ -378,6 +378,7 @@ def server_command(host: str, port: int) -> list[str]:
         "--no-jinja",
         "--chat-template-file", str(TEMPLATE_PATH),
         "--temp", "0",
+        "--sleep-idle-seconds", "240",
     ]
 
 
