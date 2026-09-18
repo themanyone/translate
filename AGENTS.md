@@ -24,9 +24,35 @@ This project implements a command-line translation app with speech-to-text capab
 - `README.md`: Added `--speak-input` usage entry
 - Existing design docs remain accurate (feature generalizes input language detection for speaking)
 
+### 5. Speaker Selection: `-s` / `--speaker`
+- `parse_args()`: Added `-s N` / `--speaker N` (int, default None)
+- `speak()`: Appends `--speaker N` to the piper command when set
+- `translate_once()` and `run_repl()`: Thread the `speaker` value through to `speak()`
+
+### 6. Input Speaker: `-si` / `--speak-input [N]`
+- `_extract_speak_input()`: Pulls `-si`/`--speak-input` out of argv, accepting
+  an optional speaker id attached (`-si2`, `-si=2`, `--speak-input=2`) or
+  separate (`-si 2`); a non-numeric token stays a phrase, so the bare flag
+  still works before a phrase
+- `parse_args()`: Exposes the value as `args.input_speaker`
+- `translate_once()` and `run_repl()`: Input speech uses `input_speaker`;
+  output speech keeps using `speaker`
+
+### 7. Multi-Speaker Voice Selection: `-s` / `-si`
+- `MULTI_SPEAKER_VOICES`: known multi-speaker piper voices per language,
+  taken from the official catalog (`voices.json`); most voices have only
+  one speaker, so a speaker id would otherwise be a silent no-op
+- `_voice_num_speakers()`: reads `num_speakers` from a voice's `.onnx.json`
+- `voice_for_language(..., multi_speaker=True)`: prefers a multi-speaker
+  voice already on disk, downloads the known one if needed, and otherwise
+  falls back to the normal voice
+- `speak()`: when the resolved voice has one speaker, warns that the
+  speaker id has no effect instead of passing a meaningless `--speaker`
+
 ## Testing
 
-All 87 tests pass, including the new test for `--speak-input` functionality.
+All 101 tests pass, covering `--speak-input`, `-s`, `-si`, and multi-speaker
+voice selection.
 
 ## Behavior
 

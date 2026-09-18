@@ -69,6 +69,28 @@ PREFERRED_VOICES: dict[str, str] = {
     "ru": "ru_RU-irina-medium",
 }
 
+# Voices with more than one speaker, from the official piper catalog
+# (voices.json). Used only when a speaker id is requested: most preferred
+# voices are single-speaker, so -s/-si would otherwise be a silent no-op.
+MULTI_SPEAKER_VOICES: dict[str, str] = {
+    "de": "de_DE-mls-medium",
+    "fr": "fr_FR-mls-medium",
+    "nl": "nl_NL-mls-medium",
+    "uk": "uk_UA-ukrainian_tts-medium",
+    "es": "es_ES-sharvard-medium",
+    "vi": "vi_VN-vivos-x_low",
+    "ne": "ne_NP-google-medium",
+    "bn": "bn_BD-google-medium",
+    "no": "no_NO-nvcc-medium",
+    "mr": "mr_IN-google-medium",
+    "cy": "cy_GB-bu_tts-medium",
+    "kk": "kk_KZ-issai-high",
+    "et": "et_EE-news-medium",
+    "ja": "ja_JP-hi_fi_captain-medium",
+    "ku": "ku_TR-berfin_renas-medium",
+    "sr": "sr_RS-serbski_institut-medium",
+}
+
 # Prompt used to identify the input language via the running model.
 DETECT_PROMPT = (
     "Answer with exactly one word: the ISO 639-1 code "
@@ -512,22 +534,70 @@ def stop_server(state_dir: Path | None = None) -> bool:
 
 # --- speech ----------------------------------------------------------------
 
+def _voice_num_speakers(voice: str) -> int:
+    """Number of speakers in a piper voice; 1 when the config is unreadable."""
+    try:
+        with open(f"{voice}.json", encoding="utf-8") as handle:
+            config = json.load(handle)
+        return int(config.get("num_speakers", 1))
+    except (OSError, ValueError, TypeError):
+        return 1
+
+
+def _download_voice(name: str, debug: bool = False, stderr=None) -> str | None:
+    """Download one piper voice; return its .onnx path, or None on failure."""
+    print(f"downloading voice {name}...", file=sys.stderr)
+    download_cmd = [DOWNLOAD_VOICES, "--download-dir", str(PIPER_DIR), name]
+    _debug_command(download_cmd, debug, stderr)
+    try:
+        result = subprocess.run(
+            download_cmd, capture_output=True, text=True, timeout=600
+        )
+    except (OSError, subprocess.TimeoutExpired) as err:
+        print(f"warning: voice download failed: {err}", file=sys.stderr)
+        return None
+    path = PIPER_DIR / f"{name}.onnx"
+    if result.returncode == 0 and path.exists():
+        return str(path)
+    return None
+
+
 def voice_for_language(
-    lang: str, debug: bool = False, stderr=None
+    lang: str, debug: bool = False, stderr=None, multi_speaker: bool = False
 ) -> str | None:
     """Find a piper voice file for an output language.
 
     Preferred voices first, then any {lang}_* file already downloaded,
-    then download_voices listing + download of the first match.
+    then download_voices listing + download of the first match. With
+    multi_speaker, only a voice with several speakers is chosen, because
+    piper ignores --speaker on single-speaker voices.
     """
-    preferred = PREFERRED_VOICES.get(lang)
-    if preferred:
-        path = PIPER_DIR / f"{preferred}.onnx"
-        if path.exists():
-            return str(path)
+    known = MULTI_SPEAKER_VOICES.get(lang)
+    preferred = []
+    if multi_speaker and known:
+        preferred.append(known)
+    if PREFERRED_VOICES.get(lang):
+        preferred.append(PREFERRED_VOICES[lang])
+    for name in preferred:
+        path = PIPER_DIR / f"{name}.onnx"
+        if not path.exists():
+            continue
+        if multi_speaker and _voice_num_speakers(str(path)) <= 1:
+            continue
+        return str(path)
     existing = sorted(PIPER_DIR.glob(f"{lang}_*.onnx"))
+    if multi_speaker:
+        existing = [p for p in existing if _voice_num_speakers(str(p)) > 1]
     if existing:
         return str(existing[0])
+    if multi_speaker:
+        if known:
+            downloaded = _download_voice(known, debug=debug, stderr=stderr)
+            if downloaded is not None:
+                return downloaded
+        # No multi-speaker voice available: fall back so speech still works
+        # (the caller warns that the speaker id has no effect).
+        return voice_for_language(lang, debug=debug, stderr=stderr)
     # Not on disk: consult download_voices for the first matching voice.
     _debug_command([DOWNLOAD_VOICES], debug, stderr)
     try:
@@ -542,44 +612,39 @@ def voice_for_language(
     for line in listing.stdout.splitlines():
         name = line.strip()
         if name.startswith(f"{lang}_"):
-            print(f"downloading voice {name}...", file=sys.stderr)
-            download_cmd = [
-                DOWNLOAD_VOICES, "--download-dir", str(PIPER_DIR), name
-            ]
-            _debug_command(download_cmd, debug, stderr)
-            try:
-                result = subprocess.run(
-                    download_cmd,
-                    capture_output=True, text=True, timeout=600,
-                )
-            except (OSError, subprocess.TimeoutExpired) as err:
-                print(f"warning: voice download failed: {err}",
-                      file=sys.stderr)
-                return None
-            if result.returncode == 0 and (
-                PIPER_DIR / f"{name}.onnx"
-            ).exists():
-                return str(PIPER_DIR / f"{name}.onnx")
-            return None
+            return _download_voice(name, debug=debug, stderr=stderr)
     return None
 
 
 def speak(
-    text: str, lang: str, debug: bool = False, stderr=None
+    text: str, lang: str, debug: bool = False, stderr=None,
+    speaker: int | None = None,
 ) -> bool:
     """Say the translation aloud; False on any failure (never raises).
 
     piper plays the audio itself: text goes to its stdin, no output file.
+    ``speaker`` selects a voice speaker id; single-speaker voices ignore
+    it, so the user is warned instead of being silently ignored.
     """
-    voice = voice_for_language(lang, debug=debug, stderr=stderr)
+    out = stderr if stderr is not None else sys.stderr
+    voice = voice_for_language(lang, debug=debug, stderr=stderr,
+                               multi_speaker=speaker is not None)
     if voice is None:
-        out = stderr if stderr is not None else sys.stderr
         print(
             f"warning: no piper voice found for language {lang!r}",
             file=out,
         )
         return False
     piper_cmd = [PIPER, "--cuda", "--model", voice]
+    if speaker is not None:
+        if _voice_num_speakers(voice) > 1:
+            piper_cmd += ["--speaker", str(speaker)]
+        else:
+            print(
+                f"warning: voice {Path(voice).stem} for {lang!r} has one "
+                f"speaker, so speaker {speaker} has no effect",
+                file=out,
+            )
     _debug_command(piper_cmd, debug, stderr, input_text=text)
     # piper chatters onnxruntime/CUDA warnings to stderr; only show them
     # under --debug, where the user is actually diagnosing something.
@@ -607,7 +672,41 @@ def speak(
 
 # --- CLI --------------------------------------------------------------------
 
+_SPEAK_INPUT_RE = re.compile(r"^(?:-si|--speak-input)(?:=?([0-9]+))?$")
+
+
+def _extract_speak_input(argv: list[str]) -> tuple[list[str], int | None]:
+    """Pull -si/--speak-input out of argv, capturing an optional speaker id.
+
+    The speaker id may be attached (-si2, -si=2, --speak-input=2) or
+    separate (-si 2). A numeric token after the bare flag is the input
+    speaker; anything else stays a positional phrase, so bare
+    --speak-input keeps working when a phrase follows it.
+    """
+    rest: list[str] = []
+    input_speaker: int | None = None
+    i = 0
+    while i < len(argv):
+        match = _SPEAK_INPUT_RE.match(argv[i])
+        if match is None:
+            rest.append(argv[i])
+            i += 1
+            continue
+        value = match.group(1)
+        nxt = argv[i + 1] if i + 1 < len(argv) else None
+        if value is None and nxt is not None and re.fullmatch(r"[0-9]+", nxt):
+            value = nxt
+            i += 2
+        else:
+            i += 1
+        rest.append("--speak-input")
+        if value is not None:
+            input_speaker = int(value)
+    return rest, input_speaker
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
+    argv, input_speaker = _extract_speak_input(list(argv))
     parser = argparse.ArgumentParser(
         prog="translate",
         description="Translate text, print and speak it.",
@@ -630,8 +729,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="print the translation without speaking it",
     )
     parser.add_argument(
-        "--speak-input", dest="speak_input_flag", action="store_true",
-        help="speak the input text in its original language (if detected or specified)",
+        "-si", "--speak-input", dest="speak_input_flag", action="store_true",
+        help="speak the input text in its original language (if detected "
+        "or specified); -si N also picks a piper speaker id for the input",
+    )
+    parser.add_argument(
+        "-s", "--speaker", type=int, metavar="N",
+        help="piper speaker id for multi-speaker voices "
+        "(default: the voice's own default)",
     )
     parser.add_argument(
         "--host", default=DEFAULT_HOST,
@@ -661,6 +766,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--version", action="version", version=f"translate {__version__}"
     )
     args = parser.parse_args(argv)
+    args.input_speaker = input_speaker
     try:
         if args.from_lang is not None:
             args.from_lang = resolve_language(args.from_lang)
@@ -708,6 +814,8 @@ def translate_once(
     to_lang: str | None,
     speak_flag: bool,
     speak_input_flag: bool = False,
+    speaker: int | None = None,
+    input_speaker: int | None = None,
     stdout=None,
     debug: bool = False,
     stderr=None,
@@ -743,9 +851,11 @@ def translate_once(
     out = stdout if stdout is not None else sys.stdout
     print(f"{target}: {translation}", file=out)
     if speak_input_flag:
-        speak(text, direction_source, debug=debug, stderr=stderr)
+        speak(text, direction_source, debug=debug, stderr=stderr,
+              speaker=input_speaker)
     if speak_flag:
-        speak(translation, target, debug=debug, stderr=stderr)
+        speak(translation, target, debug=debug, stderr=stderr,
+              speaker=speaker)
 
 
 def run_repl(
@@ -754,6 +864,8 @@ def run_repl(
     to_lang: str | None,
     speak_flag: bool,
     speak_input_flag: bool = False,
+    speaker: int | None = None,
+    input_speaker: int | None = None,
     stdout=None,
     debug: bool = False,
     model: str | None = None,
@@ -773,7 +885,8 @@ def run_repl(
         try:
             translate_once(
                 line, server_url, from_lang, to_lang, speak_flag,
-                speak_input_flag, stdout=out, debug=debug, model=model,
+                speak_input_flag, speaker, input_speaker=input_speaker,
+                stdout=out, debug=debug, model=model,
             )
         except TranslateError as err:
             print(f"error: {err}", file=sys.stderr)
@@ -810,12 +923,15 @@ def main(argv: list[str] | None = None) -> int:
                 args.to_lang,
                 args.speak_flag,
                 args.speak_input_flag,
+                args.speaker,
+                input_speaker=args.input_speaker,
                 debug=args.debug,
                 model=model_id,
             )
         else:
             run_repl(server_url, args.from_lang, args.to_lang,
-                     args.speak_flag, args.speak_input_flag, debug=args.debug, model=model_id)
+                     args.speak_flag, args.speak_input_flag, args.speaker,
+                     args.input_speaker, debug=args.debug, model=model_id)
     except TranslateError as err:
         print(f"error: {err}", file=sys.stderr)
         return 1

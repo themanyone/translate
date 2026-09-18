@@ -396,6 +396,65 @@ class TestVoiceForLanguage(unittest.TestCase):
             with mock.patch.object(translate_module, "PIPER_DIR", piper_dir):
                 self.assertEqual(voice_for_language("de"), str(other))
 
+    def test_num_speakers_reads_voice_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            voice = Path(tmp) / "de_DE-mls-medium.onnx"
+            voice.write_bytes(b"x")
+            Path(f"{voice}.json").write_text('{"num_speakers": 236}')
+            self.assertEqual(
+                translate_module._voice_num_speakers(str(voice)), 236
+            )
+            self.assertEqual(
+                translate_module._voice_num_speakers("/missing/v.onnx"), 1
+            )
+
+    def test_multi_speaker_prefers_multitalk_voice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            piper_dir = Path(tmp)
+            single = piper_dir / "de_DE-karlsson-low.onnx"
+            single.write_bytes(b"x")
+            multi = piper_dir / "de_DE-mls-medium.onnx"
+            multi.write_bytes(b"x")
+            Path(f"{multi}.json").write_text('{"num_speakers": 236}')
+            with mock.patch.object(translate_module, "PIPER_DIR", piper_dir):
+                self.assertEqual(
+                    voice_for_language("de"), str(single)
+                )
+                self.assertEqual(
+                    voice_for_language("de", multi_speaker=True), str(multi)
+                )
+
+    def test_multi_speaker_downloads_known_voice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            piper_dir = Path(tmp)
+            downloaded = piper_dir / "fr_FR-mls-medium.onnx"
+
+            def fake_run(cmd, **kwargs):
+                downloaded.write_bytes(b"x")
+                Path(f"{downloaded}.json").write_text('{"num_speakers": 125}')
+                result = mock.MagicMock()
+                result.returncode = 0
+                return result
+
+            with mock.patch.object(translate_module, "PIPER_DIR", piper_dir), \
+                    mock.patch("translate.subprocess.run",
+                               side_effect=fake_run):
+                self.assertEqual(
+                    voice_for_language("fr", multi_speaker=True),
+                    str(downloaded),
+                )
+
+    def test_multi_speaker_falls_back_when_none_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            piper_dir = Path(tmp)
+            single = piper_dir / "ru_RU-irina-medium.onnx"
+            single.write_bytes(b"x")
+            Path(f"{single}.json").write_text('{"num_speakers": 1}')
+            with mock.patch.object(translate_module, "PIPER_DIR", piper_dir):
+                self.assertEqual(
+                    voice_for_language("ru", multi_speaker=True), str(single)
+                )
+
     def test_downloads_first_matching_voice(self):
         with tempfile.TemporaryDirectory() as tmp:
             piper_dir = Path(tmp)
@@ -445,7 +504,9 @@ class TestSpeak(unittest.TestCase):
         ) as vf, mock.patch("translate.subprocess.Popen") as popen:
             popen.return_value.wait.return_value = 0
             self.assertTrue(speak("Привет!", "ru"))
-        vf.assert_called_once_with("ru", debug=False, stderr=None)
+        vf.assert_called_once_with(
+            "ru", debug=False, stderr=None, multi_speaker=False
+        )
         argv = popen.call_args[0][0]
         self.assertEqual(argv[0], "piper")
         self.assertIn("--cuda", argv)
@@ -506,6 +567,40 @@ class TestSpeak(unittest.TestCase):
             "translate.subprocess.Popen", side_effect=OSError("boom")
         ), mock.patch("sys.stderr"):
             self.assertFalse(speak("hi", "ru"))
+
+    def test_speaker_flag_passed_to_piper(self):
+        with mock.patch(
+            "translate.voice_for_language", return_value="/fake/v.onnx"
+        ) as vf, mock.patch(
+            "translate._voice_num_speakers", return_value=4
+        ), mock.patch("translate.subprocess.Popen") as popen:
+            popen.return_value.wait.return_value = 0
+            self.assertTrue(speak("hi", "en", speaker=2))
+        vf.assert_called_once_with(
+            "en", debug=False, stderr=None, multi_speaker=True
+        )
+        argv = popen.call_args[0][0]
+        self.assertEqual(argv[argv.index("--speaker") + 1], "2")
+
+    def test_single_speaker_voice_warns_and_omits_flag(self):
+        err = io.StringIO()
+        with mock.patch(
+            "translate.voice_for_language", return_value="/fake/v.onnx"
+        ), mock.patch(
+            "translate._voice_num_speakers", return_value=1
+        ), mock.patch("translate.subprocess.Popen") as popen:
+            popen.return_value.wait.return_value = 0
+            self.assertTrue(speak("hi", "ru", speaker=2, stderr=err))
+        self.assertNotIn("--speaker", popen.call_args[0][0])
+        self.assertIn("speaker 2 has no effect", err.getvalue())
+
+    def test_no_speaker_flag_by_default(self):
+        with mock.patch(
+            "translate.voice_for_language", return_value="/fake/v.onnx"
+        ), mock.patch("translate.subprocess.Popen") as popen:
+            popen.return_value.wait.return_value = 0
+            self.assertTrue(speak("hi", "en"))
+        self.assertNotIn("--speaker", popen.call_args[0][0])
 
 
 class TestServerManager(unittest.TestCase):
@@ -717,6 +812,42 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(args.router_host, "localhost")
         self.assertEqual(args.router_port, 8087)
 
+    def test_parse_args_speaker_flag(self):
+        self.assertIsNone(parse_args(["hi"]).speaker)
+        self.assertEqual(parse_args(["-s", "2", "hi"]).speaker, 2)
+        self.assertEqual(parse_args(["--speaker", "7", "hi"]).speaker, 7)
+
+    def test_parse_args_speak_input_bare(self):
+        args = parse_args(["--speak-input", "hello", "world"])
+        self.assertTrue(args.speak_input_flag)
+        self.assertIsNone(args.input_speaker)
+        self.assertEqual(args.phrase, ["hello", "world"])
+        self.assertTrue(parse_args(["-si", "hello"]).speak_input_flag)
+
+    def test_parse_args_input_speaker(self):
+        args = parse_args(["-si", "2", "hello"])
+        self.assertTrue(args.speak_input_flag)
+        self.assertEqual(args.input_speaker, 2)
+        self.assertEqual(args.phrase, ["hello"])
+        self.assertEqual(
+            parse_args(["--speak-input", "3", "hello"]).input_speaker, 3
+        )
+        self.assertEqual(parse_args(["--speak-input=4", "hi"]).input_speaker, 4)
+        self.assertEqual(parse_args(["-si5", "hi"]).input_speaker, 5)
+
+    def test_translate_once_forwards_speaker(self):
+        out = io.StringIO()
+        with mock.patch("translate.detect_language", return_value="en"), \
+                mock.patch("translate.translate", return_value="Hola"), \
+                mock.patch("translate.speak") as sp:
+            translate_once(
+                "Hello!", "http://x", None, None, True, speaker=2,
+                stdout=out,
+            )
+        sp.assert_called_once_with(
+            "Hola", "es", debug=False, stderr=None, speaker=2
+        )
+
     def test_translate_once_prints_output_language_prefix(self):
         out = io.StringIO()
         with mock.patch("translate.detect_language", return_value="en"), \
@@ -726,7 +857,9 @@ class TestCLI(unittest.TestCase):
                 "Hello!", "http://x", None, None, True, stdout=out
             )
         self.assertEqual(out.getvalue(), "es: ¡Hola!\n")
-        sp.assert_called_once_with("¡Hola!", "es", debug=False, stderr=None)
+        sp.assert_called_once_with(
+            "¡Hola!", "es", debug=False, stderr=None, speaker=None
+        )
 
     def test_translate_once_speaks_input(self):
         out = io.StringIO()
@@ -743,8 +876,29 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(
             sp.call_args_list,
             [
-                mock.call("Bonjour", "fr", debug=False, stderr=None),
-                mock.call("Hello", "en", debug=False, stderr=None),
+                mock.call("Bonjour", "fr", debug=False, stderr=None,
+                          speaker=None),
+                mock.call("Hello", "en", debug=False, stderr=None,
+                          speaker=None),
+            ],
+        )
+
+    def test_translate_once_uses_input_speaker(self):
+        out = io.StringIO()
+        with mock.patch("translate.detect_language", return_value="fr"), \
+                mock.patch("translate.translate", return_value="Hello"), \
+                mock.patch("translate.speak") as sp:
+            translate_once(
+                "Bonjour", "http://x", None, None, True, True,
+                speaker=1, input_speaker=5, stdout=out,
+            )
+        self.assertEqual(
+            sp.call_args_list,
+            [
+                mock.call("Bonjour", "fr", debug=False, stderr=None,
+                          speaker=5),
+                mock.call("Hello", "en", debug=False, stderr=None,
+                          speaker=1),
             ],
         )
 
@@ -849,6 +1003,38 @@ class TestCLI(unittest.TestCase):
             code = main(["--from", "English", "--to", "Russian", "Hello!"])
         self.assertEqual(code, 0)
         det.assert_not_called()
+
+    def test_main_passes_speaker(self):
+        with mock.patch("translate.find_router_model", return_value=None), \
+                mock.patch("translate.ensure_server", return_value="http://x"), \
+                mock.patch("translate.detect_language", return_value="en"), \
+                mock.patch("translate.translate", return_value="Hola"), \
+                mock.patch("translate.speak", return_value=True) as sp, \
+                mock.patch("sys.stdout"):
+            code = main(["-s", "2", "Hello!"])
+        self.assertEqual(code, 0)
+        sp.assert_called_once_with(
+            "Hola", "es", debug=False, stderr=None, speaker=2
+        )
+
+    def test_main_passes_input_speaker(self):
+        with mock.patch("translate.find_router_model", return_value=None), \
+                mock.patch("translate.ensure_server", return_value="http://x"), \
+                mock.patch("translate.detect_language", return_value="en"), \
+                mock.patch("translate.translate", return_value="Hola"), \
+                mock.patch("translate.speak", return_value=True) as sp, \
+                mock.patch("sys.stdout"):
+            code = main(["-si", "5", "Hello!"])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            sp.call_args_list,
+            [
+                mock.call("Hello!", "en", debug=False, stderr=None,
+                          speaker=5),
+                mock.call("Hola", "es", debug=False, stderr=None,
+                          speaker=None),
+            ],
+        )
 
     def test_main_one_shot_error_exits_nonzero(self):
         with mock.patch("translate.find_router_model", return_value=None), \

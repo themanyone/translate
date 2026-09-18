@@ -81,6 +81,15 @@ llama-server --jinja --models-dir /my/models --models-preset
   `--to Spanish`.
 - `translate --no-speak <phrase...>` - print only.
 - `translate --speak-input <phrase...>` - speak the input text in its original language before translating.
+- `translate -si <n> <phrase...>` (or `--speak-input <n>`, `--speak-input=<n>`)
+  - speak the input and pick its piper speaker id; `-si`/`--speak-input`
+  without a number still enables input speaking.
+- `translate -s <n> <phrase...>` (or `--speaker`) - pick a piper speaker id
+  for multi-speaker voices (e.g. `-s 2`).
+- When a speaker id is given, a multi-speaker voice is preferred and
+  downloaded if needed (e.g. `de_DE-mls-medium` for German); most piper
+  voices have only one speaker, so for those languages the id has no
+  effect and a warning says so.
 - `translate --router-port <port>` - router server port (default 8087);
   `--router-host` likewise (default 127.0.0.1)
 - `translate --stop-server` - stop the auto-started dedicated llama-server.
